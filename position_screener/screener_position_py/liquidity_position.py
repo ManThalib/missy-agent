@@ -28,6 +28,18 @@ class LiquidityPosition:
     # Optional enrichment from a normalized pool snapshot; kept separate
     # so the core model stays protocol-agnostic.
     pool_enrichment: Optional[Dict[str, Any]] = field(default=None)
+    # Derived position metrics computed at scan time
+    current_bin_id: int = 0
+    in_range: bool = False
+    current_price: float = 0.0
+    lower_price: float = 0.0
+    upper_price: float = 0.0
+    fees_usd: float = 0.0
+    rewards_usd: float = 0.0
+    days_open: float = 0.0
+    current_value_usd: float = 0.0
+    token_x_amount: Dict[str, Any] = field(default_factory=lambda: {"raw": "0", "ui": 0.0})
+    token_y_amount: Dict[str, Any] = field(default_factory=lambda: {"raw": "0", "ui": 0.0})
 
     @property
     def has_claimable(self) -> bool:

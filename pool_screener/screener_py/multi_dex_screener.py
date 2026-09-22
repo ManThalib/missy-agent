@@ -1,9 +1,23 @@
 """Provider normalization and shared multi-DEX screening policy."""
 
+import base64
 import math
 from collections.abc import Mapping
 from operator import attrgetter
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _decode_active_bin_id(account_data: bytes) -> int:
+    """Extract activeId from Meteora DLMM LbPair account data.
+
+    The LbPair account layout has activeId as the first u32 field after the
+    8-byte discriminator, at offset 8.
+    """
+    if len(account_data) < 12:
+        return 0
+    # activeId is a u32 (4 bytes) at offset 8 (after 8-byte discriminator)
+    active_id = int.from_bytes(account_data[8:12], "little")
+    return active_id
 
 from .candidate import Candidate
 from .client import MeteoraClient, MultiDexClient, OrcaClient, RaydiumClient
@@ -49,6 +63,25 @@ def _integer(value: Any, field: str) -> int:
         return int(value or 0)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"invalid {field}: {value!r}") from exc
+
+
+def _fetch_active_bin_id(rpc: Any, pool_address: str) -> int:
+    """Fetch activeId from a Meteora DLMM LbPair account via RPC.
+
+    Returns 0 if the call fails or the field cannot be decoded.
+    """
+    try:
+        result = rpc.get_account_info(pool_address)
+        data = result.get("data", "") if isinstance(result, dict) else ""
+        if isinstance(data, str):
+            decoded = base64.b64decode(data)
+        elif isinstance(data, bytes):
+            decoded = data
+        else:
+            decoded = b""
+        return _decode_active_bin_id(decoded)
+    except Exception:
+        return 0
 
 
 def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
@@ -208,10 +241,12 @@ class MultiDexScreener:
         whitelist: Whitelist,
         config: Optional[FilterConfig] = None,
         client: Optional[Any] = None,
+        rpc: Optional[Any] = None,
     ):
         self.whitelist = whitelist
         self.config = config or FilterConfig()
         self.client = client or MultiDexClient(timeout=self.config.timeout)
+        self.rpc = rpc
         self.scorer = PoolScorer()
 
     def screen_pool(self, p: Dict[str, Any]) -> Tuple[Optional[Candidate], str]:
@@ -291,7 +326,12 @@ class MultiDexScreener:
                 f"volatility {volatility:.1f} > max {cfg.max_volatility:.1f} (IL risk)",
             )
 
-        # 5. Protocol-neutral score, normalized to daily observations.
+        # 5. Fetch active bin ID via RPC for DLMM pools
+        active_bin_id = 0
+        if self.rpc and pool_type.lower().startswith("concentr"):
+            active_bin_id = _fetch_active_bin_id(self.rpc, n.get("pool_address", ""))
+
+        # 6. Protocol-neutral score, normalized to daily observations.
         breakdown = self.scorer.score(
             PoolScoreInput(
                 tvl_usd=tvl,
@@ -334,6 +374,7 @@ class MultiDexScreener:
             apr=apr,
             fee_rate=float(n.get("fee_rate") or 0.0),
             tick_spacing=tick_spacing,
+            active_bin_id=active_bin_id,
             effective_tvl=breakdown.effective_tvl,
             realized_fee_apr=breakdown.realized_fee_apr,
             adjusted_apr=breakdown.adjusted_apr,

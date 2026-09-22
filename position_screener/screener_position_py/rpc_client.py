@@ -4,7 +4,7 @@ import json
 import threading
 import urllib.error
 import urllib.request
-from typing import Any, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 
 class RpcClient:
@@ -53,6 +53,27 @@ class RpcClient:
         if body.get("error"):
             raise RuntimeError(f"{method}: {body['error']}")
         return body.get("result")
+
+    def get_account_info(self, address: str) -> Dict[str, Any]:
+        """Get account info via RPC getAccountInfo call."""
+        body = self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": self._reserve_request_ids()[0],
+                "method": "getAccountInfo",
+                "params": [address, {"encoding": "base64"}],
+            }
+        )
+        if not isinstance(body, dict):
+            raise RuntimeError(f"getAccountInfo: invalid response")
+        if body.get("error"):
+            raise RuntimeError(f"getAccountInfo: {body['error']}")
+        result = body.get("result", {})
+        if isinstance(result, str):
+            import base64
+            decoded = base64.b64decode(result)
+            return {"data": decoded, "owner": ""}
+        return result
 
     def batch(self, calls: Iterable[Tuple[str, List[Any]]]) -> List[Any]:
         call_list = list(calls)

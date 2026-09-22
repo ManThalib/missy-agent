@@ -39,6 +39,16 @@ class Candidate:
     screened_at: float = field(default_factory=time.time)
     wallet_positions: List[Dict[str, Any]] = field(default_factory=list)
 
+    # Meteora DLMM discovery API fields (preserved in output)
+    pool_price: float = 0.0  # Price of token_x denominated in token_y
+    token_x_address: str = ""  # Mint address of token_x
+    token_x_decimals: int = 0  # Base-10 decimals of token_x
+    token_x_price_usd: float = 0.0  # Token X price in USD
+    token_y_address: str = ""  # Mint address of token_y
+    token_y_decimals: int = 0  # Base-10 decimals of token_y
+    token_y_price_usd: float = 0.0  # Token Y price in USD
+    active_bin_id: int = 0  # Active bin ID from DLMM LbPair account
+
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the candidate to a JSON-compatible dictionary."""
         return {
@@ -70,4 +80,13 @@ class Candidate:
             "lp_fee_share": self.lp_fee_share,
             "screened_at": self.screened_at,
             "wallet_positions": [dict(position) for position in self.wallet_positions],
+            # Meteora DLMM discovery API fields
+            "pool_price": self.pool_price,
+            "token_x_address": self.token_x_address,
+            "token_x_decimals": self.token_x_decimals,
+            "token_x_price_usd": self.token_x_price_usd,
+            "token_y_address": self.token_y_address,
+            "token_y_decimals": self.token_y_decimals,
+            "token_y_price_usd": self.token_y_price_usd,
+            "active_bin_id": self.active_bin_id,
         }

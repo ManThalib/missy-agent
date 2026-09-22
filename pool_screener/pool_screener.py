@@ -13,6 +13,11 @@ from screener_py import (
     print_results,
 )
 
+from position_screener.screener_position_py.rpc_client import RpcClient
+<tool_call>
+<function=bash-3.31.0: is not a variable in /Users/manthalib/Missy-agent/pool_screener/screener_py/multi_dex_screener.py
+)
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -213,7 +218,11 @@ def main() -> int:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
     config = FilterConfig.from_args(args)
-    screener = MultiDexScreener(whitelist=whitelist, config=config)
+    rpc_url = os.environ.get(
+        "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
+    )
+    rpc = RpcClient(rpc_url) if rpc_url else None
+    screener = MultiDexScreener(whitelist=whitelist, config=config, rpc=rpc)
 
     def run_cycle() -> bool:
         current_time = time.strftime("%H:%M:%S")

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import os
 import struct
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -193,8 +194,67 @@ class PositionScanner:
                 item.position_address,
             )
         )
+
+        # Fetch SOL balance via RPC
+        sol_balance_lamports = 0
+        sol_price_usd = 0.0
+        try:
+            sol_result = self.rpc.call("getBalance", [wallet, "finalized"])
+            sol_balance_lamports = sol_result.get("value", 0) if isinstance(sol_result, dict) else 0
+        except Exception:
+            pass
+
+        # Fetch token accounts and enrich with prices
+        wallet_balances: List[Dict[str, Any]] = []
+        try:
+            calls = [
+                (
+                    "getTokenAccountsByOwner",
+                    [
+                        wallet,
+                        {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                        {"encoding": "jsonParsed", "commitment": "finalized"},
+                    ],
+                )
+            ]
+            result = self.rpc.batch(calls)
+            token_accounts = (result or {}).get("value", [])
+            for account in token_accounts:
+                info = (
+                    (account.get("account") or {}).get("data") or {}
+                ).get("parsed") or {}
+                info = info.get("info") or {}
+                mint = info.get("mint")
+                amount = info.get("tokenAmount") or {}
+                raw_amount = amount.get("amount", "0")
+                decimals = amount.get("decimals", 0)
+                ui_amount = float(raw_amount) / (10 ** decimals) if decimals > 0 else float(raw_amount)
+                if mint:
+                    wallet_balances.append(
+                        {
+                            "mint": mint,
+                            "symbol": info.get("owner", ""),
+                            "decimals": decimals,
+                            "raw_amount": raw_amount,
+                            "ui_amount": ui_amount,
+                            "price_usd": 0.0,
+                            "usd_value": 0.0,
+                        }
+                    )
+        except Exception:
+            pass
+
+        # Calculate total USD value
+        wallet_total_usd = sol_balance_lamports / 1_000_000_000 * sol_price_usd
+        for bal in wallet_balances:
+            wallet_total_usd += bal.get("usd_value", 0.0)
+
         return PositionScan(
             wallet=wallet,
+            sol_balance_lamports=sol_balance_lamports,
+            sol_price_usd=sol_price_usd,
+            wallet_total_usd=wallet_total_usd,
+            wallet_balances=wallet_balances,
             positions=merged,
             errors=errors,
             history_complete=history_complete,
