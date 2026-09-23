@@ -14,9 +14,6 @@ from screener_py import (
 )
 
 from position_screener.screener_position_py.rpc_client import RpcClient
-<tool_call>
-<function=bash-3.31.0: is not a variable in /Users/manthalib/Missy-agent/pool_screener/screener_py/multi_dex_screener.py
-)
 
 def _positive_int(value: str) -> int:
     parsed = int(value)

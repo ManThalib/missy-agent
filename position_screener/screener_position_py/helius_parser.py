@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+from .coercion import (
+    as_items,
+    as_mapping,
+    b58decode,
+    to_int,
+    token_amount,
+    ui_amount_to_raw,
+)
 from .helius_types import (
     AccountBalanceDelta,
     NamedAccount,
@@ -26,7 +33,6 @@ TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 COMPUTE_BUDGET_PROGRAM = "ComputeBudget111111111111111111111111111111"
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
 LAMPORTS_PER_SOL = 1_000_000_000
-_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 DEX_PROGRAMS = {
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": "JUPITER",
@@ -40,48 +46,6 @@ DEX_PROGRAMS = {
 }
 
 JsonPayload = Union[bytes, str, Mapping[str, Any], Sequence[Mapping[str, Any]]]
-
-
-def _dict(value: Any) -> Mapping[str, Any]:
-    return value if isinstance(value, Mapping) else {}
-
-
-def _items(value: Any) -> Iterable[Any]:
-    return value if isinstance(value, (list, tuple)) else ()
-
-
-def _int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-
-
-def _amount(value: Any) -> Tuple[int, int]:
-    amount = _dict(value)
-    raw = amount.get("amount", amount.get("tokenAmount", 0))
-    return _int(raw), _int(amount.get("decimals"))
-
-
-def _ui_amount_to_raw(value: Any, decimals: int) -> int:
-    try:
-        amount = Decimal(str(value)) * (Decimal(10) ** decimals)
-        if not amount.is_finite() or amount < 0:
-            return 0
-        return int(amount)
-    except (InvalidOperation, TypeError, ValueError, OverflowError):
-        return 0
-
-
-def _b58decode(value: str) -> bytes:
-    number = 0
-    try:
-        for char in value:
-            number = number * 58 + _B58_ALPHABET.index(char)
-    except ValueError:
-        return b""
-    raw = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
-    return b"\0" * (len(value) - len(value.lstrip("1"))) + raw
 
 
 class HeliusWebhookParser:
@@ -103,16 +67,16 @@ class HeliusWebhookParser:
         return tuple(self.parse_transaction(record) for record in records)
 
     def parse_transaction(self, record: Mapping[str, Any]) -> NormalizedTransaction:
-        parsed = _dict(record.get("parsed"))
+        parsed = as_mapping(record.get("parsed"))
         body = parsed or record
-        raw_transaction = _dict(record.get("transaction"))
-        message = _dict(raw_transaction.get("message"))
-        meta = _dict(record.get("meta"))
+        raw_transaction = as_mapping(record.get("transaction"))
+        message = as_mapping(raw_transaction.get("message"))
+        meta = as_mapping(record.get("meta"))
         account_keys = self._account_keys(message, meta)
         instructions = self._instructions(body, message, meta, account_keys)
 
         signatures = tuple(
-            str(item) for item in _items(raw_transaction.get("signatures")) if item
+            str(item) for item in as_items(raw_transaction.get("signatures")) if item
         )
         signature = str(
             record.get("signature")
@@ -130,16 +94,16 @@ class HeliusWebhookParser:
             else json.dumps(error_value, sort_keys=True, default=str)
         )
 
-        fee = _int(body.get("fee", meta.get("fee")))
-        signature_count = len(signatures) or _int(
-            _dict(message.get("header")).get("numRequiredSignatures"), 1
+        fee = to_int(body.get("fee", meta.get("fee")))
+        signature_count = len(signatures) or to_int(
+            as_mapping(message.get("header")).get("numRequiredSignatures"), 1
         )
         base_fee = min(fee, max(signature_count, 1) * 5_000) if fee else 0
         priority_value = body.get("priorityFee")
         if priority_value is None:
             priority_value = meta.get("prioritizationFee", meta.get("priorityFee"))
         if priority_value is not None:
-            priority_fee = max(_int(priority_value), 0)
+            priority_fee = max(to_int(priority_value), 0)
             priority_source = "payload"
         elif fee:
             priority_fee = max(fee - base_fee, 0)
@@ -155,10 +119,11 @@ class HeliusWebhookParser:
         token_fees = self._token_fees(body, instructions, token_transfers)
         rent = tuple(
             RentAdjustment(
-                str(_dict(item).get("pubkey", "")), _int(_dict(item).get("lamports"))
+                str(as_mapping(item).get("pubkey", "")),
+                to_int(as_mapping(item).get("lamports")),
             )
-            for item in _items(meta.get("rewards"))
-            if str(_dict(item).get("rewardType", "")).lower() == "rent"
+            for item in as_items(meta.get("rewards"))
+            if str(as_mapping(item).get("rewardType", "")).lower() == "rent"
         )
         fee_payer = str(
             body.get("feePayer") or (account_keys[0] if account_keys else "")
@@ -169,7 +134,7 @@ class HeliusWebhookParser:
 
         return NormalizedTransaction(
             signature=signature,
-            slot=_int(body.get("slot", record.get("slot"))),
+            slot=to_int(body.get("slot", record.get("slot"))),
             block_time=self._optional_int(
                 body.get("blockTime", body.get("timestamp", record.get("blockTime")))
             ),
@@ -198,20 +163,20 @@ class HeliusWebhookParser:
 
     @staticmethod
     def _optional_int(value: Any) -> Optional[int]:
-        return None if value is None else _int(value)
+        return None if value is None else to_int(value)
 
     @staticmethod
     def _account_keys(
         message: Mapping[str, Any], meta: Mapping[str, Any]
     ) -> Tuple[str, ...]:
         keys = []
-        for item in _items(message.get("accountKeys")):
-            value = _dict(item).get("pubkey") if isinstance(item, Mapping) else item
+        for item in as_items(message.get("accountKeys")):
+            value = as_mapping(item).get("pubkey") if isinstance(item, Mapping) else item
             if value:
                 keys.append(str(value))
-        loaded = _dict(meta.get("loadedAddresses"))
-        keys.extend(str(item) for item in _items(loaded.get("writable")))
-        keys.extend(str(item) for item in _items(loaded.get("readonly")))
+        loaded = as_mapping(meta.get("loadedAddresses"))
+        keys.extend(str(item) for item in as_items(loaded.get("writable")))
+        keys.extend(str(item) for item in as_items(loaded.get("readonly")))
         return tuple(keys)
 
     def _instructions(
@@ -227,14 +192,14 @@ class HeliusWebhookParser:
             if body.get("instructions") is not None
             else message.get("instructions")
         )
-        for item in _items(outer):
-            instruction = self._instruction(_dict(item), keys, False)
+        for item in as_items(outer):
+            instruction = self._instruction(as_mapping(item), keys, False)
             result.append(instruction)
-            for inner in _items(_dict(item).get("innerInstructions")):
-                result.append(self._instruction(_dict(inner), keys, True))
-        for group in _items(meta.get("innerInstructions")):
-            for item in _items(_dict(group).get("instructions")):
-                result.append(self._instruction(_dict(item), keys, True))
+            for inner in as_items(as_mapping(item).get("innerInstructions")):
+                result.append(self._instruction(as_mapping(inner), keys, True))
+        for group in as_items(meta.get("innerInstructions")):
+            for item in as_items(as_mapping(group).get("instructions")):
+                result.append(self._instruction(as_mapping(item), keys, True))
         return tuple(result)
 
     @staticmethod
@@ -243,10 +208,10 @@ class HeliusWebhookParser:
     ) -> ParsedInstruction:
         program_id = str(item.get("programId", ""))
         if not program_id:
-            index = _int(item.get("programIdIndex"), -1)
+            index = to_int(item.get("programIdIndex"), -1)
             program_id = keys[index] if 0 <= index < len(keys) else ""
-        parsed = _dict(item.get("parsed"))
-        decoded = _dict(item.get("decoded"))
+        parsed = as_mapping(item.get("parsed"))
+        decoded = as_mapping(item.get("decoded"))
         name = str(
             item.get("instructionName")
             or parsed.get("type")
@@ -257,7 +222,7 @@ class HeliusWebhookParser:
         decoded_accounts = decoded.get("accounts")
         if isinstance(decoded_accounts, (list, tuple)):
             for account in decoded_accounts:
-                value = _dict(account)
+                value = as_mapping(account)
                 address = value.get("pubkey") or value.get("address")
                 if address:
                     accounts.append(
@@ -271,18 +236,18 @@ class HeliusWebhookParser:
                     else str(account)
                 )
                 accounts.append(NamedAccount(str(index), address))
-        for key, value in _dict(parsed.get("info")).items():
+        for key, value in as_mapping(parsed.get("info")).items():
             if isinstance(value, str) and len(value) >= 32:
                 accounts.append(NamedAccount(str(key), value))
-        info = _dict(parsed.get("info"))
-        token_amount = _dict(info.get("tokenAmount"))
-        if token_amount:
-            amount_raw, decimals = _amount(token_amount)
+        info = as_mapping(parsed.get("info"))
+        token_amount_obj = as_mapping(info.get("tokenAmount"))
+        if token_amount_obj:
+            amount_raw, decimals = token_amount(token_amount_obj)
         else:
-            amount_raw = _int(info.get("lamports", info.get("amount")))
-            decimals = _int(info.get("decimals"))
+            amount_raw = to_int(info.get("lamports", info.get("amount")))
+            decimals = to_int(info.get("decimals"))
         data = str(item.get("data", ""))
-        raw = _b58decode(data)
+        raw = b58decode(data)
         if (
             not amount_raw
             and program_id in {TOKEN_PROGRAM, TOKEN_2022_PROGRAM}
@@ -304,9 +269,9 @@ class HeliusWebhookParser:
         if isinstance(explicit, (list, tuple)):
             return tuple(
                 NativeTransfer(
-                    str(_dict(item).get("fromUserAccount", "")),
-                    str(_dict(item).get("toUserAccount", "")),
-                    _int(_dict(item).get("amount")),
+                    str(as_mapping(item).get("fromUserAccount", "")),
+                    str(as_mapping(item).get("toUserAccount", "")),
+                    to_int(as_mapping(item).get("amount")),
                 )
                 for item in explicit
             )
@@ -324,7 +289,7 @@ class HeliusWebhookParser:
                 destination = names.get("destination", names.get("1", ""))
                 # Parsed System Program instructions expose lamports in info,
                 # while compiled instructions retain it in little-endian data.
-                raw = _b58decode(instruction.data)
+                raw = b58decode(instruction.data)
                 lamports = instruction.amount_raw or (
                     int.from_bytes(raw[4:12], "little") if len(raw) >= 12 else 0
                 )
@@ -340,13 +305,13 @@ class HeliusWebhookParser:
         if isinstance(explicit, (list, tuple)):
             result = []
             for item in explicit:
-                value = _dict(item)
+                value = as_mapping(item)
                 raw_amount = value.get("rawTokenAmount")
                 if raw_amount is not None:
-                    amount, decimals = _amount(raw_amount)
+                    amount, decimals = token_amount(raw_amount)
                 else:
-                    decimals = _int(value.get("decimals"))
-                    amount = _ui_amount_to_raw(value.get("tokenAmount", 0), decimals)
+                    decimals = to_int(value.get("decimals"))
+                    amount = ui_amount_to_raw(value.get("tokenAmount", 0), decimals)
                 result.append(
                     TokenTransfer(
                         str(value.get("mint", "")),
@@ -396,15 +361,15 @@ class HeliusWebhookParser:
         if isinstance(account_data, (list, tuple)):
             return tuple(
                 AccountBalanceDelta(
-                    str(_dict(item).get("account", "")),
+                    str(as_mapping(item).get("account", "")),
                     0,
                     0,
-                    _int(_dict(item).get("nativeBalanceChange")),
+                    to_int(as_mapping(item).get("nativeBalanceChange")),
                 )
                 for item in account_data
             )
-        pre = tuple(_int(item) for item in _items(meta.get("preBalances")))
-        post = tuple(_int(item) for item in _items(meta.get("postBalances")))
+        pre = tuple(to_int(item) for item in as_items(meta.get("preBalances")))
+        post = tuple(to_int(item) for item in as_items(meta.get("postBalances")))
         return tuple(
             AccountBalanceDelta(
                 keys[index] if index < len(keys) else "",
@@ -424,10 +389,10 @@ class HeliusWebhookParser:
         if isinstance(account_data, (list, tuple)):
             result = []
             for account in account_data:
-                account_value = _dict(account)
-                for item in _items(account_value.get("tokenBalanceChanges")):
-                    value = _dict(item)
-                    amount, decimals = _amount(value.get("rawTokenAmount"))
+                account_value = as_mapping(account)
+                for item in as_items(account_value.get("tokenBalanceChanges")):
+                    value = as_mapping(item)
+                    amount, decimals = token_amount(value.get("rawTokenAmount"))
                     result.append(
                         TokenBalanceDelta(
                             str(
@@ -446,12 +411,12 @@ class HeliusWebhookParser:
             return tuple(result)
         balances: Dict[Tuple[int, str], List[Any]] = {}
         for side, field in ((0, "preTokenBalances"), (1, "postTokenBalances")):
-            for item in _items(meta.get(field)):
-                value = _dict(item)
-                index = _int(value.get("accountIndex"), -1)
+            for item in as_items(meta.get(field)):
+                value = as_mapping(item)
+                index = to_int(value.get("accountIndex"), -1)
                 key = (index, str(value.get("mint", "")))
                 entry = balances.setdefault(key, [0, 0, 0, "", ""])
-                amount, decimals = _amount(value.get("uiTokenAmount"))
+                amount, decimals = token_amount(value.get("uiTokenAmount"))
                 entry[side] = amount
                 entry[2] = decimals
                 entry[3] = str(value.get("owner", entry[3]))
@@ -476,14 +441,14 @@ class HeliusWebhookParser:
         transfers: Tuple[TokenTransfer, ...],
     ) -> Tuple[TokenFee, ...]:
         result = []
-        for index, item in enumerate(_items(body.get("tokenTransfers"))):
-            value = _dict(item)
+        for index, item in enumerate(as_items(body.get("tokenTransfers"))):
+            value = as_mapping(item)
             fee_value = value.get("feeAmount", value.get("transferFee"))
             if fee_value is not None:
                 fee, decimals = (
-                    _amount(fee_value)
+                    token_amount(fee_value)
                     if isinstance(fee_value, Mapping)
-                    else (_int(fee_value), transfers[index].decimals)
+                    else (to_int(fee_value), transfers[index].decimals)
                 )
                 transfer = transfers[index]
                 result.append(
@@ -523,7 +488,7 @@ class HeliusWebhookParser:
         token_transfers: Tuple[TokenTransfer, ...],
         fee_payer: str,
     ) -> Optional[SwapEvent]:
-        swap = _dict(_dict(body.get("events")).get("swap"))
+        swap = as_mapping(as_mapping(body.get("events")).get("swap"))
         if not swap and str(body.get("type", "")).upper() != "SWAP":
             return None
         inputs = self._swap_assets(swap, "tokenInputs", "nativeInput")
@@ -536,9 +501,9 @@ class HeliusWebhookParser:
             dex = DEX_PROGRAMS.get(instruction.program_id)
             if dex and dex not in route:
                 route.append(dex)
-        for inner in _items(swap.get("innerSwaps")):
+        for inner in as_items(swap.get("innerSwaps")):
             program = str(
-                _dict(inner).get("programInfo", _dict(inner).get("source", ""))
+                as_mapping(inner).get("programInfo", as_mapping(inner).get("source", ""))
             )
             if program and program not in route:
                 route.append(program)
@@ -560,26 +525,26 @@ class HeliusWebhookParser:
         swap: Mapping[str, Any], token_field: str, native_field: str
     ) -> Tuple[SwapAsset, ...]:
         result = []
-        native = _dict(swap.get(native_field))
+        native = as_mapping(swap.get(native_field))
         if native:
             result.append(
                 SwapAsset(
                     "SOL",
-                    _int(native.get("amount")),
+                    to_int(native.get("amount")),
                     9,
                     str(native.get("account", "")),
                     "",
                     True,
                 )
             )
-        for item in _items(swap.get(token_field)):
-            value = _dict(item)
+        for item in as_items(swap.get(token_field)):
+            value = as_mapping(item)
             raw = value.get("rawTokenAmount")
             if raw is not None:
-                amount, decimals = _amount(raw)
+                amount, decimals = token_amount(raw)
             else:
-                decimals = _int(value.get("decimals"))
-                amount = _ui_amount_to_raw(value.get("tokenAmount", 0), decimals)
+                decimals = to_int(value.get("decimals"))
+                amount = ui_amount_to_raw(value.get("tokenAmount", 0), decimals)
             result.append(
                 SwapAsset(
                     str(value.get("mint", "")),

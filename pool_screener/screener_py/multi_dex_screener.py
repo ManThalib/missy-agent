@@ -1,27 +1,19 @@
 """Provider normalization and shared multi-DEX screening policy."""
 
 import base64
-import math
-from collections.abc import Mapping
 from operator import attrgetter
 from typing import Any, Dict, List, Optional, Tuple
-
-
-def _decode_active_bin_id(account_data: bytes) -> int:
-    """Extract activeId from Meteora DLMM LbPair account data.
-
-    The LbPair account layout has activeId as the first u32 field after the
-    8-byte discriminator, at offset 8.
-    """
-    if len(account_data) < 12:
-        return 0
-    # activeId is a u32 (4 bytes) at offset 8 (after 8-byte discriminator)
-    active_id = int.from_bytes(account_data[8:12], "little")
-    return active_id
 
 from .candidate import Candidate
 from .client import MeteoraClient, MultiDexClient, OrcaClient, RaydiumClient
 from .config import DEFAULT_CONFIG, FilterConfig
+from .normalize_utils import (
+    finite_float,
+    integer,
+    mapping,
+    token_entry,
+    top_level_token_metadata,
+)
 from .scoring import PoolScoreInput, PoolScorer
 from .whitelist import Whitelist, normalize_symbol
 
@@ -44,25 +36,16 @@ _ORCA_TIMEFRAMES = {"day": "24h", "week": "7d", "month": "30d"}
 _WINDOW_DAYS = {"day": 1.0, "week": 7.0, "month": 30.0}
 
 
-def _mapping(value: Any) -> Mapping[str, Any]:
-    return value if isinstance(value, Mapping) else {}
+def _decode_active_bin_id(account_data: bytes) -> int:
+    """Extract activeId from Meteora DLMM LbPair account data.
 
-
-def _finite_float(value: Any, field: str) -> float:
-    try:
-        number = float(value or 0.0)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"invalid {field}: {value!r}") from exc
-    if not math.isfinite(number):
-        raise ValueError(f"invalid {field}: value must be finite")
-    return number
-
-
-def _integer(value: Any, field: str) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"invalid {field}: {value!r}") from exc
+    The LbPair account layout has activeId as the first u32 field after the
+    8-byte discriminator, at offset 8.
+    """
+    if len(account_data) < 12:
+        return 0
+    active_id = int.from_bytes(account_data[8:12], "little")
+    return active_id
 
 
 def _fetch_active_bin_id(rpc: Any, pool_address: str) -> int:
@@ -84,45 +67,43 @@ def _fetch_active_bin_id(rpc: Any, pool_address: str) -> int:
         return 0
 
 
+def _volatility(price: float, price_min: float, price_max: float) -> float:
+    if price > 0 and price_min > 0 and price_max > 0:
+        return abs(price_max - price_min) / price * 100.0
+    return 0.0
+
+
 def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
     """Converts a provider pool into the common shape used by the screener."""
     if not isinstance(pool, dict):
         raise ValueError("pool payload must be an object")
 
     if "mintA" in pool or "mintB" in pool:
-        mint_a = _mapping(pool.get("mintA"))
-        mint_b = _mapping(pool.get("mintB"))
-        token_x = {
-            "symbol": mint_a.get("symbol", ""),
-            "address": mint_a.get("address", ""),
-        }
-        token_y = {
-            "symbol": mint_b.get("symbol", ""),
-            "address": mint_b.get("address", ""),
-        }
+        mint_a = mapping(pool.get("mintA"))
+        mint_b = mapping(pool.get("mintB"))
+        token_x = token_entry(mint_a)
+        token_y = token_entry(mint_b)
         name = f"{mint_a.get('symbol', '?')}-{mint_b.get('symbol', '?')}"
         pool_address = pool.get("id", "")
         pool_type = pool.get("type", "")
-        tvl = _finite_float(pool.get("tvl"), "TVL")
-        fee_rate = _finite_float(pool.get("feeRate"), "fee rate")
+        tvl = finite_float(pool.get("tvl"), "TVL")
+        fee_rate = finite_float(pool.get("feeRate"), "fee rate")
 
-        period = _mapping(pool.get(window) or pool.get("day"))
-        volume = _finite_float(period.get("volume"), "volume")
-        volume_fee = _finite_float(period.get("volumeFee"), "fees")
-        apr = _finite_float(period.get("apr"), "APR")
+        period = mapping(pool.get(window) or pool.get("day"))
+        volume = finite_float(period.get("volume"), "volume")
+        volume_fee = finite_float(period.get("volumeFee"), "fees")
+        apr = finite_float(period.get("apr"), "APR")
         if not apr:
-            apr = _finite_float(period.get("feeApr"), "fee APR")
-        price = _finite_float(pool.get("price"), "price")
-        price_min = _finite_float(period.get("priceMin"), "minimum price")
-        price_max = _finite_float(period.get("priceMax"), "maximum price")
-        volatility = 0.0
-        if price > 0 and price_min > 0 and price_max > 0:
-            volatility = abs(price_max - price_min) / price * 100.0
+            apr = finite_float(period.get("feeApr"), "fee APR")
+        price = finite_float(pool.get("price"), "price")
+        price_min = finite_float(period.get("priceMin"), "minimum price")
+        price_max = finite_float(period.get("priceMax"), "maximum price")
+        volatility = _volatility(price, price_min, price_max)
 
         fee_tvl_ratio = (volume_fee / tvl * 100.0) if tvl > 0 and volume_fee else 0.0
 
-        provider_config = _mapping(pool.get("config"))
-        tick_spacing = _integer(provider_config.get("tickSpacing"), "tick spacing")
+        provider_config = mapping(pool.get("config"))
+        tick_spacing = integer(provider_config.get("tickSpacing"), "tick spacing")
 
         return {
             "dex": pool.get("_dex", "raydium"),
@@ -142,47 +123,53 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
             "bin_step": tick_spacing,
             "token_x": token_x,
             "token_y": token_y,
+            "pool_price": price,
+            "active_bin_id": 0,
+            "current_tick_index": 0,
+            **top_level_token_metadata(token_x, token_y),
         }
+
     if pool.get("_dex") == "orca" or "tvlUsdc" in pool:
-        token_a = _mapping(pool.get("tokenA")) or {
-            "symbol": "",
-            "address": pool.get("tokenMintA", ""),
-        }
-        token_b = _mapping(pool.get("tokenB")) or {
-            "symbol": "",
-            "address": pool.get("tokenMintB", ""),
-        }
+        token_a = token_entry(
+            pool.get("tokenA"), default_address=pool.get("tokenMintA", "")
+        )
+        token_b = token_entry(
+            pool.get("tokenB"), default_address=pool.get("tokenMintB", "")
+        )
         timeframe = _ORCA_TIMEFRAMES.get(window, "24h")
-        stats = _mapping(_mapping(pool.get("stats")).get(timeframe))
-        tvl = _finite_float(pool.get("tvlUsdc"), "TVL")
-        fees = _finite_float(stats.get("fees"), "fees")
+        stats = mapping(mapping(pool.get("stats")).get(timeframe))
+        tvl = finite_float(pool.get("tvlUsdc"), "TVL")
+        fees = finite_float(stats.get("fees"), "fees")
         price_history = pool.get("priceHistory7d") or []
         if not isinstance(price_history, list):
             raise ValueError("invalid price history: expected a list")
         prices = [
-            _finite_float(value, "price history value")
+            finite_float(value, "price history value")
             for value in price_history
             if value is not None
         ]
-        current_price = _finite_float(pool.get("price"), "price")
+        current_price = finite_float(pool.get("price"), "price")
         volatility = 0.0
         volatility_available = timeframe == "7d" and current_price > 0 and bool(prices)
         if volatility_available:
             volatility = (max(prices) - min(prices)) / current_price * 100.0
-        fee_rate = _finite_float(pool.get("feeRate"), "fee rate") / 1_000_000.0
-        tick_spacing = _integer(pool.get("tickSpacing"), "tick spacing")
+        fee_rate = finite_float(pool.get("feeRate"), "fee rate") / 1_000_000.0
+        tick_spacing = integer(pool.get("tickSpacing"), "tick spacing")
+        current_tick_index = (
+            finite_float(pool.get("tickCurrentIndex"), "tickCurrentIndex") or 0
+        )
         return {
             "dex": "orca",
             "pool_address": pool.get("address", ""),
-            "name": f"{token_a.get('symbol', '?')}-{token_b.get('symbol', '?')}",
+            "name": f"{token_a['symbol']}-{token_b['symbol']}",
             "pool_type": "Splash" if tick_spacing == 32896 else "Whirlpool",
             "tvl": tvl,
             "fee_tvl_ratio": (fees / tvl * 100.0) if tvl > 0 else 0.0,
             "fee": fees,
-            "volume": _finite_float(stats.get("volume"), "volume"),
+            "volume": finite_float(stats.get("volume"), "volume"),
             "volatility": volatility,
             "volatility_available": volatility_available,
-            "apr": _finite_float(stats.get("yieldOverTvl"), "yield over TVL")
+            "apr": finite_float(stats.get("yieldOverTvl"), "yield over TVL")
             * 100.0
             * (
                 365.0
@@ -193,42 +180,45 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
             "fee_rate": fee_rate,
             "tick_spacing": tick_spacing,
             "bin_step": tick_spacing,
-            "token_x": {
-                "symbol": token_a.get("symbol", ""),
-                "address": token_a.get("address", pool.get("tokenMintA", "")),
-            },
-            "token_y": {
-                "symbol": token_b.get("symbol", ""),
-                "address": token_b.get("address", pool.get("tokenMintB", "")),
-            },
+            "token_x": token_a,
+            "token_y": token_b,
+            "current_tick_index": current_tick_index,
+            **top_level_token_metadata(token_a, token_b),
+            "pool_price": current_price,
+            "active_bin_id": 0,
         }
+
     if pool.get("_dex") == "meteora" or "dlmm_params" in pool:
         normalized = dict(pool)
         normalized["dex"] = "meteora"
         normalized["pool_type"] = "DLMM"
-        normalized["tick_spacing"] = _integer(
-            _mapping(pool.get("dlmm_params")).get("bin_step"), "bin step"
+        normalized["tick_spacing"] = integer(
+            mapping(pool.get("dlmm_params")).get("bin_step"), "bin step"
         )
         normalized["bin_step"] = normalized["tick_spacing"]
         for field in ("tvl", "fee", "volume", "apr", "fee_pct"):
-            normalized[field] = _finite_float(pool.get(field), field)
+            normalized[field] = finite_float(pool.get(field), field)
         normalized.setdefault("fee_rate", normalized["fee_pct"] / 100.0)
-        current_price = _finite_float(
+        current_price = finite_float(
             pool.get("pool_price", pool.get("price")), "price"
         )
-        price_min = _finite_float(pool.get("min_price"), "minimum price")
-        price_max = _finite_float(pool.get("max_price"), "maximum price")
-        if current_price > 0 and price_min > 0 and price_max > 0:
-            normalized["volatility"] = (
-                abs(price_max - price_min) / current_price * 100.0
-            )
-            normalized["volatility_available"] = True
-        else:
-            normalized["volatility"] = _finite_float(
-                pool.get("volatility"), "volatility"
-            )
-            normalized["volatility_available"] = "volatility" in pool
+        price_min = finite_float(pool.get("min_price"), "minimum price")
+        price_max = finite_float(pool.get("max_price"), "maximum price")
+        normalized["volatility"] = _volatility(current_price, price_min, price_max)
+        normalized["volatility_available"] = (
+            current_price > 0 and price_min > 0 and price_max > 0
+        ) or "volatility" in pool
+        if "volatility" in pool and normalized["volatility"] == 0.0:
+            normalized["volatility"] = finite_float(pool.get("volatility"), "volatility")
+        token_x = token_entry(pool.get("tokenX"))
+        token_y = token_entry(pool.get("tokenY"))
+        normalized["token_x"] = token_x
+        normalized["token_y"] = token_y
+        normalized.update(top_level_token_metadata(token_x, token_y))
+        normalized["active_bin_id"] = finite_float(pool.get("activeId"), "activeId") or 0
+        normalized["current_tick_index"] = normalized["active_bin_id"]
         return normalized
+
     # Already normalized (or legacy Meteora shape); pass it through.
     return dict(pool)
 
@@ -323,7 +313,7 @@ class MultiDexScreener:
         if cfg.max_volatility > 0 and volatility > cfg.max_volatility:
             return (
                 None,
-                f"volatility {volatility:.1f} > max {cfg.max_volatility:.1f} (IL risk)",
+                f"volatility {volatility:.1f}% > max {cfg.max_volatility:.1f}% (IL risk)",
             )
 
         # 5. Fetch active bin ID via RPC for DLMM pools

@@ -1,13 +1,11 @@
 """Raydium pool-discovery client."""
 
-import json
-import time
 import urllib.parse
-import urllib.request
 from typing import Any, Dict, List, Optional
 
 from ..constants import RAYDIUM_LIST_V2, RAYDIUM_POOLS_BY_MINT
 from ..filter_config import FilterConfig
+from .base_client import HttpJsonClient
 
 SORT_FIELDS = {
     "24h": {
@@ -31,7 +29,7 @@ SORT_FIELDS = {
 }
 
 
-class RaydiumClient:
+class RaydiumClient(HttpJsonClient):
     """Fetch Raydium Standard and concentrated pools."""
 
     def __init__(
@@ -40,30 +38,8 @@ class RaydiumClient:
         timeout: float = 15.0,
         pools_by_mint_url: str = RAYDIUM_POOLS_BY_MINT,
     ) -> None:
-        self.base_url = base_url
-        self.timeout = timeout
+        super().__init__(base_url=base_url, timeout=timeout)
         self.pools_by_mint_url = pools_by_mint_url
-
-    def _get_json(self, url: str) -> Dict[str, Any]:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; PoolScreener/1.0)",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Pool API error: HTTP {response.status}")
-                data = json.loads(response.read().decode("utf-8"))
-        except Exception as exc:
-            raise RuntimeError(f"GET {url[:120]} failed: {exc}") from exc
-        if isinstance(data, dict) and data.get("success") is False:
-            raise RuntimeError(f"Raydium API error: {data.get('msg')}")
-        if not isinstance(data, dict):
-            raise RuntimeError("Pool API returned a non-object JSON payload")
-        return data
 
     @staticmethod
     def _sort_field(config: FilterConfig) -> str:
@@ -92,7 +68,7 @@ class RaydiumClient:
         for pool_type in self._pool_types(config):
             next_page_id = ""
             for _ in range(max_pages):
-                params = {
+                params: Dict[str, Any] = {
                     "poolType": pool_type,
                     "sortField": sort_field,
                     "sortType": "desc",
@@ -104,20 +80,12 @@ class RaydiumClient:
                     f"{self.base_url}?{urllib.parse.urlencode(params)}"
                 )
                 payload = data.get("data", {})
-                pools = payload.get("data", []) if isinstance(payload, dict) else []
-                if not isinstance(pools, list):
-                    raise RuntimeError("Raydium pool list is not an array")
-                all_pools.extend(
-                    {**pool, "_dex": "raydium"}
-                    for pool in pools
-                    if isinstance(pool, dict)
-                )
-                next_page_id = (
-                    payload.get("nextPageId") or "" if isinstance(payload, dict) else ""
-                )
-                if not next_page_id or not pools:
+                payload = payload if isinstance(payload, dict) else {}
+                all_pools.extend(self._extract_pools(payload, "raydium"))
+                next_page_id = payload.get("nextPageId") or ""
+                if not next_page_id or not payload.get("data"):
                     break
-                time.sleep(0.15)
+                self._pause()
         return all_pools
 
     def fetch_pools_by_mint(
@@ -128,7 +96,7 @@ class RaydiumClient:
         page_size: int = 100,
         page: int = 1,
     ) -> List[Dict[str, Any]]:
-        params = {
+        params: Dict[str, Any] = {
             "mint1": mint1,
             "poolType": pool_type,
             "poolSortField": "liquidity",
@@ -142,7 +110,9 @@ class RaydiumClient:
             f"{self.pools_by_mint_url}?{urllib.parse.urlencode(params)}"
         )
         payload = data.get("data", {})
-        pools = payload.get("data", []) if isinstance(payload, dict) else []
-        if not isinstance(pools, list):
-            raise RuntimeError("Raydium pool list is not an array")
-        return [pool for pool in pools if isinstance(pool, dict)]
+        payload = payload if isinstance(payload, dict) else {}
+        return [
+            pool
+            for pool in payload.get("data", [])
+            if isinstance(pool, dict)
+        ]
