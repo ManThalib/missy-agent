@@ -24,10 +24,11 @@ HELIUS_HISTORY_URL = (
     "https://mainnet.helius-rpc.com/v1/parsed-events/transaction-history"
 )
 
-# Jupiter Price API v2 (keyless).
+# Jupiter Price API (keyless). v2 endpoints have been retired; use v3.
 JUPITER_PRICE_V2_URL = os.environ.get(
-    "JUPITER_PRICE_V2_URL", "https://lite-api.jup.ag/price/v2"
+    "JUPITER_PRICE_V2_URL", "https://api.jup.ag/price/v3"
 ).rstrip("/")
+JUPITER_PRICE_V3_URL = JUPITER_PRICE_V2_URL
 
 # Public pool-discovery endpoints.
 RAYDIUM_LIST_V2 = f"{RAYDIUM_API_BASE}/pools/info/list-v2"

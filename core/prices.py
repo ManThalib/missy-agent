@@ -54,7 +54,18 @@ class JupiterPriceClient(HttpJsonClient):
     @staticmethod
     def _parse_prices(data: Mapping[str, Any]) -> Dict[str, float]:
         prices: Dict[str, float] = {}
-        payload = data.get("data", {}) if isinstance(data, Mapping) else {}
+        if not isinstance(data, Mapping):
+            return prices
+        # Jupiter Price API v3 returns a flat mapping of mint -> price entry.
+        if "data" not in data:
+            for mint, entry in data.items():
+                if not isinstance(entry, Mapping):
+                    continue
+                price = _entry_price(entry)
+                if price is not None:
+                    prices[mint] = price
+            return prices
+        payload = data.get("data", {})
         if isinstance(payload, Mapping):
             for mint, entry in payload.items():
                 price = _entry_price(entry)
