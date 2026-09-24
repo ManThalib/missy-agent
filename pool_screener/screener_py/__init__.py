@@ -1,5 +1,14 @@
 """Multi-DEX Solana pool discovery, normalization, filtering, and scoring."""
 
+import os as _os
+import sys as _sys
+
+_REPO_ROOT = _os.path.dirname(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+)
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+
 from .candidate import Candidate
 from .candidate_json_encoder import CandidateJSONEncoder
 from .client import MeteoraClient, MultiDexClient, OrcaClient, RaydiumClient

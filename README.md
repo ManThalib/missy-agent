@@ -1,9 +1,10 @@
 # Solana Multi-DEX Screener Suite
 
-A standard-library Python suite for screening liquidity pools and monitoring wallet positions on Meteora DLMM, Raydium Standard/CLMM, and Orca Whirlpools. The project is split into two independent tools:
+A standard-library Python suite for screening liquidity pools and monitoring wallet positions on Meteora DLMM, Raydium Standard/CLMM, and Orca Whirlpools. The project is split into three independent tools:
 
 1. **Pool Screener**: Discovers and filters pools using provider APIs.
 2. **Position Screener**: Analyzes active and historical LP positions for a given wallet using RPC.
+3. **Wallet Scanner**: Fetches SOL, SPL, and Token-2022 balances, prices them in USD via Jupiter, and filters assets below a configurable USD threshold.
 
 The applications do not build, sign, or submit transactions. Pool discovery uses indexed public APIs and is appropriate for screening, not settlement.
 
@@ -25,10 +26,11 @@ The applications do not build, sign, or submit transactions. Pool discovery uses
 - Outbound HTTPS access
 - A Solana RPC endpoint for wallet position scans
 - A Helius API key only when historical position lifecycle data is required
+- A Solana wallet public key for wallet scans (or set `WALLET_PUBLIC_KEY`)
 
 ## Setup
 
-No installation or virtual environment is required. The project is split into two independent tools: `pool_screener` and `position_screener`.
+No installation or virtual environment is required. The project is split into three independent tools: `pool_screener`, `position_screener`, and `wallet_scanner`.
 
 ### Pool Screener
 
@@ -58,6 +60,7 @@ For local development, export values in the shell or source your own `.env`:
 ```dotenv
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 HELIUS_API_KEY=your-helius-key
+WALLET_PUBLIC_KEY=your-wallet-public-key
 RAYDIUM_API_BASE=https://api-v3.raydium.io
 ORCA_API_BASE=https://api.orca.so
 METEORA_API_BASE=https://dlmm-api.meteora.ag
@@ -115,13 +118,25 @@ An explicitly selected missing or malformed configuration file is a CLI error.
 ```bash
 cd position_screener
 python3 position_screener.py --wallet YOUR_SOLANA_WALLET
-cd position_screener
 python3 position_screener.py --wallet YOUR_SOLANA_WALLET --show-inactive
-cd position_screener
 python3 position_screener.py --wallet YOUR_SOLANA_WALLET --json
-cd position_screener
 python3 position_screener.py --wallet YOUR_SOLANA_WALLET --position-history-pages 5
 ```
+
+## Wallet Scanner
+
+```bash
+cd wallet_scanner
+python3 -m wallet_scanner.main --help
+python3 -m wallet_scanner.main --wallet YOUR_SOLANA_WALLET
+python3 -m wallet_scanner.main --wallet YOUR_SOLANA_WALLET --json
+python3 -m wallet_scanner.main --wallet YOUR_SOLANA_WALLET --include-dust
+```
+
+The scanner fetches SOL and all SPL/Token-2022 balances, prices them in USD via
+the Jupiter Price API v2 (no key required), and filters assets whose total USD
+value is at or below the configured threshold (default $0.10). The `--threshold`
+flag and `$WALLET_PUBLIC_KEY` environment variable are also supported.
 
 Current positions are fetched from Solana RPC. If `HELIUS_API_KEY` is set,
 history is also reconstructed. `--position-history-pages 0` means unbounded
@@ -162,6 +177,13 @@ scan = PositionScanner().scan(
 )
 ```
 
+```python
+from wallet_scanner import WalletScanner
+
+result = WalletScanner().scan("YOUR_SOLANA_WALLET")
+print(result["total_usd"], result["asset_count"])
+```
+
 See `documentation.md` for normalized schemas, public interfaces, error
 handling, scoring behavior, and the complete directory map.
 
@@ -175,4 +197,8 @@ python3 pool_screener.py --help
 cd ../position_screener
 python3 -m unittest test_positions
 python3 position_screener.py --help
+cd ../wallet_scanner
+python3 -m unittest test_wallet_scanner
+python3 -m wallet_scanner.main --help
+python3 -m unittest core.test_core
 ```

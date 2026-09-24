@@ -2,11 +2,15 @@
 
 ## System Overview
 
-The project has two cooperating packages:
+The project has three cooperating packages plus a shared core:
 
 - `screener_py` discovers, normalizes, filters, scores, and displays pools.
 - `screener_position_py` discovers wallet LP positions, normalizes Helius
   transactions, tracks closures, and exposes conservative position analytics.
+- `wallet_scanner` fetches SOL/SPL/Token-2022 balances, prices them via Jupiter
+  Price API v2, filters dust, and reports a sorted USD portfolio.
+- `core` provides the shared HTTP, RPC, Helius, base58/Solana, normalization,
+  display, price, and wallet-balance helpers reused by all three tools.
 
 Only the Python standard library is used. Pool providers and current-position
 providers execute in bounded `ThreadPoolExecutor` workers. A failed source does
@@ -21,17 +25,29 @@ be used as settlement state. Wallet scans can write the local
 ## Directory Map
 
 ```text
-Kai-agent/
+Missy-agent/
 |-- README.md
 |-- documentation.md
 |-- AGENTS.md
+|-- core/                               # Shared utilities
+|   |-- __init__.py
+|   |-- constants.py
+|   |-- display.py
+|   |-- helius.py
+|   |-- http.py
+|   |-- normalize.py
+|   |-- prices.py
+|   |-- rpc.py
+|   |-- solana.py
+|   |-- test_core.py
+|   `-- wallet_balances.py
 |-- pool_screener/
 |   |-- pool_screener.py                # Pool CLI entrypoint
 |   |-- tokens.json                     # Token policy
 |   |-- test_screener.py
 |   `-- screener_py/                    # Public pool facade and logic
 |       |-- __init__.py
-|       |-- constants.py
+|       |-- constants.py                # Compatibility re-exports from core
 |       |-- candidate.py
 |       |-- candidate_json_encoder.py
 |       |-- filter_config.py
@@ -48,32 +64,45 @@ Kai-agent/
 |       |-- config.py
 |       |-- scoring.py
 |       |-- screener.py
+|       |-- normalize_utils.py          # Compatibility re-exports from core
 |       `-- clients/
+|           |-- __init__.py
+|           |-- base_client.py          # Compatibility re-export from core.http
 |           |-- raydium_client.py
 |           |-- orca_client.py
 |           |-- meteora_client.py
 |           `-- multi_dex_client.py
-`-- position_screener/
-    |-- position_screener.py            # Position CLI entrypoint
-    |-- position_closure_state.json     # Local closure snapshot
-    |-- test_positions.py
-    `-- screener_position_py/           # Public position facade and logic
-        |-- __init__.py
-        |-- liquidity_position.py
-        |-- position_scan.py
-        |-- rpc_client.py
-        |-- helius_history_client.py
-        |-- helius_parser.py
-        |-- helius_types.py
-        |-- position_scanner.py
-        |-- models.py
-        |-- rpc.py
-        |-- scanner.py
-        |-- display.py                  # Position terminal presentation
-        `-- analytics/
-            |-- scoring.py
-            |-- trader_scoring.py
-            `-- closure_state.py
+|-- position_screener/
+|   |-- position_screener.py            # Position CLI entrypoint
+|   |-- position_closure_state.json     # Local closure snapshot
+|   |-- test_positions.py
+|   `-- screener_position_py/           # Public position facade and logic
+|       |-- __init__.py
+|       |-- liquidity_position.py
+|       |-- position_scan.py
+|       |-- rpc_client.py               # Compatibility re-export from core.rpc
+|       |-- helius_history_client.py    # Compatibility re-export from core.helius
+|       |-- helius_parser.py
+|       |-- helius_types.py
+|       |-- position_scanner.py
+|       |-- models.py
+|       |-- rpc.py
+|       |-- scanner.py
+|       |-- display.py
+|       |-- coercion.py                 # Compatibility re-exports from core.solana
+|       `-- analytics/
+|           |-- scoring.py
+|           |-- trader_scoring.py
+|           `-- closure_state.py
+`-- wallet_scanner/
+    |-- main.py                         # Wallet scanner CLI entrypoint
+    |-- test_wallet_scanner.py
+    |-- config.py
+    |-- models.py
+    |-- rpc_client.py                   # SolanaRpcClient with retry/backoff
+    |-- price_fetcher.py              # TokenPriceFetcher (Jupiter v2)
+    |-- balance_calculator.py         # USD valuation and threshold filter
+    `-- wallet_scanner.py             # Orchestrator
 ```
 
 Compatibility modules contain imports only. Canonical implementations live in
@@ -223,6 +252,54 @@ returns `(accepted, target_token, paired_token, reason)`. An empty target set
 matches nothing. Empty or invalid paired configuration uses `SOL`, `USDC`, and
 `USDT` defaults.
 
+## Wallet Scanner APIs
+
+### `WalletScanner`
+
+```python
+from wallet_scanner import WalletScanner
+
+result = WalletScanner().scan("YOUR_SOLANA_WALLET")
+```
+
+`scan()` returns a dictionary containing the wallet address, the count of assets
+above the threshold, the total USD value of those assets, and a list of
+`TokenBalance` records serialized as dictionaries. Assets are sorted by
+`total_value_usd` in descending order.
+
+The constructor accepts:
+
+- `rpc_url`: Solana RPC URL. Defaults to `SOLANA_RPC_URL` or Helius RPC if
+  `HELIUS_API_KEY` is set.
+- `price_url`: Jupiter Price API v2 base URL. Defaults to `JUPITER_PRICE_V2_URL`.
+- `threshold_usd`: Assets with total USD value at or below this value are
+  filtered out. Defaults to `$0.10`.
+- `timeout`: Per-request timeout in seconds.
+- `rpc_client` / `price_fetcher`: Optional injected dependencies for testing or
+  advanced use.
+
+The scanner validates that the wallet is a 32-byte base58 Solana address, fetches
+the native SOL balance plus all SPL and Token-2022 balances, prices mints in
+batches of 50 via Jupiter, and applies the threshold. Pricing failures are not
+fatal; affected assets are returned with `price_usd=0.0` and filtered out unless
+`threshold_usd` is set to `0.0`.
+
+### `TokenBalance`
+
+A dataclass representing a single asset:
+
+- `mint`: SPL mint address (native SOL uses the wrapped-SOL mint address).
+- `symbol`: Human-readable symbol when available.
+- `decimals`, `amount_raw`, `amount_ui`: Token amount and precision.
+- `price_usd`, `total_value_usd`: USD price and holding value.
+- `is_native_sol`: `True` for the native SOL balance.
+
+### `TokenPriceFetcher` / `SolanaRpcClient`
+
+These one-class-per-file helpers wrap the shared `core.prices.JupiterPriceClient`
+and `core.rpc.RpcClient` with wallet-specific retry/backoff and batch sizing.
+They are not normally used directly but can be injected into `WalletScanner`.
+
 ## Position APIs
 
 ### `RpcClient`
@@ -236,7 +313,20 @@ Request-ID reservation is synchronized, so one client can be used by the
 scanner's worker threads. Batch results are restored to request order. Missing
 or duplicate response IDs, transport errors, malformed response roots, and RPC
 error objects raise `RuntimeError`. Timeout is per HTTP request; retries are not
-automatic.
+automatic. The canonical implementation lives in `core.rpc`; the per-module
+`rpc_client.py` files are thin compatibility re-exports.
+
+### Shared Core Helpers
+
+- `core.http.HttpJsonClient` — standard-library JSON GET/POST with a 150 ms
+  per-page pause.
+- `core.prices.JupiterPriceClient` — keyless Jupiter Price API v2 batch resolver.
+- `core.solana.b58encode` / `b58decode` / `discriminator` / `is_valid_solana_address`
+- `core.normalize.finite_number` / `mapping` / `token_entry`
+- `core.display.truncate` — terminal-width string truncation.
+- `core.wallet_balances` — `fetch_sol_balance_lamports`,
+  `fetch_token_accounts`, and `ui_amount` used by both position and wallet
+  scanners.
 
 ### `HeliusHistoryClient`
 
@@ -369,6 +459,8 @@ distinct path.
 | `METEORA_API_BASE` | Override Meteora API base. |
 | `SOLANA_RPC_URL` | Current-position Solana RPC endpoint. |
 | `HELIUS_API_KEY` | Enable Helius RPC fallback and lifecycle history. |
+| `WALLET_PUBLIC_KEY` | Default wallet for `wallet_scanner/main.py`. |
+| `JUPITER_PRICE_V2_URL` | Override Jupiter Price API v2 endpoint. |
 
 The project does not load `.env` itself. Set variables before the Python process
 starts because provider constants are evaluated at import time.
@@ -385,6 +477,13 @@ python3 pool_screener.py --dex meteora --pages 1 --page-size 25
 cd ../position_screener
 python3 -m unittest test_positions
 python3 position_screener.py --help
+
+cd ../wallet_scanner
+python3 -m unittest test_wallet_scanner
+python3 -m wallet_scanner.main --help
+
+cd ..
+python3 -m unittest core.test_core
 ```
 
 Before any future transaction path signs, it must re-read relevant on-chain

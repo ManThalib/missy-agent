@@ -1,12 +1,21 @@
 """Discover and decode Meteora DLMM, Raydium CLMM, and Orca positions."""
 
 import base64
-import hashlib
 import os
 import struct
-import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from core.solana import (
+    b58decode as _b58decode,
+    b58encode as _b58encode,
+    discriminator as _discriminator,
+)
+from core.wallet_balances import (
+    TOKEN_PROGRAMS,
+    fetch_sol_balance_lamports,
+    fetch_token_accounts,
+)
 
 from .helius_history_client import HeliusHistoryClient
 from .helius_parser import HeliusWebhookParser
@@ -18,42 +27,12 @@ from .rpc_client import RpcClient
 METEORA_PROGRAM = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
 RAYDIUM_PROGRAM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
 ORCA_PROGRAM = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
-TOKEN_PROGRAMS = (
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-)
 PROGRAM_DEX = {
     METEORA_PROGRAM: "meteora",
     RAYDIUM_PROGRAM: "raydium",
     ORCA_PROGRAM: "orca",
 }
-_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _RPC_BATCH_SIZE = 50
-
-
-def _discriminator(name: str) -> bytes:
-    return hashlib.sha256(f"account:{name}".encode("ascii")).digest()[:8]
-
-
-def _b58encode(value: bytes) -> str:
-    leading = len(value) - len(value.lstrip(b"\0"))
-    number = int.from_bytes(value, "big")
-    encoded = ""
-    while number:
-        number, remainder = divmod(number, 58)
-        encoded = _B58_ALPHABET[remainder] + encoded
-    return "1" * leading + encoded
-
-
-def _b58decode(value: str) -> bytes:
-    number = 0
-    for char in value:
-        try:
-            number = number * 58 + _B58_ALPHABET.index(char)
-        except ValueError as exc:
-            raise ValueError("address is not valid base58") from exc
-    raw = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
-    return b"\0" * (len(value) - len(value.lstrip("1"))) + raw
 
 
 def _account_bytes(account: Dict[str, Any]) -> bytes:
@@ -199,48 +178,25 @@ class PositionScanner:
         sol_balance_lamports = 0
         sol_price_usd = 0.0
         try:
-            sol_result = self.rpc.call("getBalance", [wallet, "finalized"])
-            sol_balance_lamports = sol_result.get("value", 0) if isinstance(sol_result, dict) else 0
+            sol_balance_lamports = fetch_sol_balance_lamports(self.rpc, wallet)
         except Exception:
             pass
 
         # Fetch token accounts and enrich with prices
         wallet_balances: List[Dict[str, Any]] = []
         try:
-            calls = [
-                (
-                    "getTokenAccountsByOwner",
-                    [
-                        wallet,
-                        {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-                        {"encoding": "jsonParsed", "commitment": "finalized"},
-                    ],
+            for account in fetch_token_accounts(self.rpc, wallet):
+                wallet_balances.append(
+                    {
+                        "mint": account["mint"],
+                        "symbol": account.get("owner", ""),
+                        "decimals": account.get("decimals", 0),
+                        "raw_amount": account.get("raw_amount", "0"),
+                        "ui_amount": account.get("ui_amount", 0.0),
+                        "price_usd": 0.0,
+                        "usd_value": 0.0,
+                    }
                 )
-            ]
-            result = self.rpc.batch(calls)
-            token_accounts = (result or {}).get("value", [])
-            for account in token_accounts:
-                info = (
-                    (account.get("account") or {}).get("data") or {}
-                ).get("parsed") or {}
-                info = info.get("info") or {}
-                mint = info.get("mint")
-                amount = info.get("tokenAmount") or {}
-                raw_amount = amount.get("amount", "0")
-                decimals = amount.get("decimals", 0)
-                ui_amount = float(raw_amount) / (10 ** decimals) if decimals > 0 else float(raw_amount)
-                if mint:
-                    wallet_balances.append(
-                        {
-                            "mint": mint,
-                            "symbol": info.get("owner", ""),
-                            "decimals": decimals,
-                            "raw_amount": raw_amount,
-                            "ui_amount": ui_amount,
-                            "price_usd": 0.0,
-                            "usd_value": 0.0,
-                        }
-                    )
         except Exception:
             pass
 

@@ -1,21 +1,7 @@
-import math
 from typing import Any, Dict, Optional, Set
 
-def truncate(s: str, max_len: int) -> str:
-    if max_len <= 0:
-        return ""
-    if len(s) <= max_len:
-        return s
-    if max_len <= 3:
-        return "." * max_len
-    return s[: max_len - 3] + "..."
-
-def _finite_number(value: Any) -> Optional[float]:
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return number if math.isfinite(number) else None
+from core.display import truncate
+from core.normalize import finite_number as _finite_number
 
 def _fee_apr_pct(enrichment: Dict[str, Any]) -> Optional[float]:
     position_value = _finite_number(enrichment.get("position_value_quote"))

@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
-import hashlib
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any, Tuple
 
-B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+from core.solana import B58_ALPHABET, b58decode, b58encode, discriminator
+
+__all__ = [
+    "B58_ALPHABET",
+    "as_items",
+    "as_mapping",
+    "b58decode",
+    "b58encode",
+    "discriminator",
+    "to_int",
+    "token_amount",
+    "ui_amount_to_raw",
+]
 
 
 def as_mapping(value: Any) -> Mapping[str, Any]:
@@ -44,33 +55,3 @@ def ui_amount_to_raw(value: Any, decimals: int) -> int:
         return int(amount)
     except (InvalidOperation, TypeError, ValueError, OverflowError):
         return 0
-
-
-def b58decode(value: str, *, strict: bool = False) -> bytes:
-    """Decode base58 *value*; raise when *strict*, otherwise return ``b""``."""
-    number = 0
-    try:
-        for char in value:
-            number = number * 58 + B58_ALPHABET.index(char)
-    except ValueError as exc:
-        if strict:
-            raise ValueError("address is not valid base58") from exc
-        return b""
-    raw = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
-    return b"\0" * (len(value) - len(value.lstrip("1"))) + raw
-
-
-def b58encode(value: bytes) -> str:
-    """Encode *value* using the Bitcoin/Solana base58 alphabet."""
-    leading = len(value) - len(value.lstrip(b"\0"))
-    number = int.from_bytes(value, "big")
-    encoded = ""
-    while number:
-        number, remainder = divmod(number, 58)
-        encoded = B58_ALPHABET[remainder] + encoded
-    return "1" * leading + encoded
-
-
-def discriminator(name: str) -> bytes:
-    """Return the 8-byte Anchor account discriminator for *name*."""
-    return hashlib.sha256(f"account:{name}".encode("ascii")).digest()[:8]

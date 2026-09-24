@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from core.constants import (  # noqa: F401  (LAMPORTS_PER_SOL re-exported)
+    LAMPORTS_PER_SOL,
+    TOKEN_2022_PROGRAM_ID,
+    TOKEN_PROGRAM_ID,
+)
 
 from .coercion import (
     as_items,
@@ -28,11 +34,10 @@ from .helius_types import (
     TokenTransfer,
 )
 
-TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+TOKEN_PROGRAM = TOKEN_PROGRAM_ID
+TOKEN_2022_PROGRAM = TOKEN_2022_PROGRAM_ID
 COMPUTE_BUDGET_PROGRAM = "ComputeBudget111111111111111111111111111111"
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
-LAMPORTS_PER_SOL = 1_000_000_000
 
 DEX_PROGRAMS = {
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": "JUPITER",

@@ -1,5 +1,14 @@
 """Wallet liquidity-position discovery for supported Solana DEX programs."""
 
+import os as _os
+import sys as _sys
+
+_REPO_ROOT = _os.path.dirname(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+)
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+
 from .analytics.closure_state import ClosureState, scan_closure_state
 from .analytics.scoring import (
     PositionScoreBreakdown,

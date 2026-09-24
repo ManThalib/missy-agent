@@ -13,7 +13,7 @@ from screener_py import (
     print_results,
 )
 
-from position_screener.screener_position_py.rpc_client import RpcClient
+from core.rpc import RpcClient
 
 def _positive_int(value: str) -> int:
     parsed = int(value)
