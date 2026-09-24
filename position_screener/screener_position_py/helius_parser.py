@@ -419,6 +419,8 @@ class HeliusWebhookParser:
             for item in as_items(meta.get(field)):
                 value = as_mapping(item)
                 index = to_int(value.get("accountIndex"), -1)
+                if index < 0:
+                    continue
                 key = (index, str(value.get("mint", "")))
                 entry = balances.setdefault(key, [0, 0, 0, "", ""])
                 amount, decimals = token_amount(value.get("uiTokenAmount"))

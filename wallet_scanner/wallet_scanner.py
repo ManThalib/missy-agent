@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Dict, List, Optional
 
 from core.solana import is_valid_solana_address
 
 from .balance_calculator import BalanceCalculator
-from .config import USD_THRESHOLD, resolve_rpc_url
+from .config import USD_THRESHOLD, WRAPPED_SOL_MINT, resolve_rpc_url
 from .models import TokenBalance
 from .price_fetcher import TokenPriceFetcher
 from .rpc_client import SolanaRpcClient
@@ -67,7 +68,8 @@ class WalletScanner:
         mints = [b.mint for b in balances]
         try:
             return self.price_fetcher.fetch_prices(mints)
-        except Exception:
+        except Exception as exc:
+            print(f"Warning: price fetch failed: {exc}", file=sys.stderr)
             return {}
 
 
@@ -88,7 +90,7 @@ def _parse_token_account(account: Any) -> Optional[TokenBalance]:
         ui_amount = 0.0
     return TokenBalance(
         mint=mint,
-        symbol=account.get("symbol", ""),
+        symbol="wSOL" if mint == WRAPPED_SOL_MINT else account.get("symbol", ""),
         decimals=decimals,
         amount_raw=str(account.get("raw_amount", "0")),
         amount_ui=ui_amount,

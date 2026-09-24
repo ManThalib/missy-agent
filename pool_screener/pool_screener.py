@@ -215,9 +215,8 @@ def main() -> int:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
     config = FilterConfig.from_args(args)
-    rpc_url = os.environ.get(
-        "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
-    )
+    # Active-bin enrichment via RPC is opt-in: set SOLANA_RPC_URL to enable.
+    rpc_url = os.environ.get("SOLANA_RPC_URL", "").strip()
     rpc = RpcClient(rpc_url) if rpc_url else None
     screener = MultiDexScreener(whitelist=whitelist, config=config, rpc=rpc)
 

@@ -55,14 +55,15 @@ def _fetch_active_bin_id(rpc: Any, pool_address: str) -> int:
     """
     try:
         result = rpc.get_account_info(pool_address)
-        data = result.get("data", "") if isinstance(result, dict) else ""
+        value = result.get("value") if isinstance(result, dict) else None
+        data = value.get("data") if isinstance(value, dict) else None
+        if isinstance(data, list) and data:
+            data = data[0]
         if isinstance(data, str):
-            decoded = base64.b64decode(data)
-        elif isinstance(data, bytes):
-            decoded = data
-        else:
-            decoded = b""
-        return _decode_active_bin_id(decoded)
+            return _decode_active_bin_id(base64.b64decode(data))
+        if isinstance(data, bytes):
+            return _decode_active_bin_id(data)
+        return 0
     except Exception:
         return 0
 
@@ -155,8 +156,8 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
             volatility = (max(prices) - min(prices)) / current_price * 100.0
         fee_rate = finite_float(pool.get("feeRate"), "fee rate") / 1_000_000.0
         tick_spacing = integer(pool.get("tickSpacing"), "tick spacing")
-        current_tick_index = (
-            finite_float(pool.get("tickCurrentIndex"), "tickCurrentIndex") or 0
+        current_tick_index = integer(
+            pool.get("tickCurrentIndex") or 0, "tickCurrentIndex"
         )
         return {
             "dex": "orca",
@@ -215,7 +216,7 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
         normalized["token_x"] = token_x
         normalized["token_y"] = token_y
         normalized.update(top_level_token_metadata(token_x, token_y))
-        normalized["active_bin_id"] = finite_float(pool.get("activeId"), "activeId") or 0
+        normalized["active_bin_id"] = integer(pool.get("activeId") or 0, "activeId")
         normalized["current_tick_index"] = normalized["active_bin_id"]
         return normalized
 
@@ -316,9 +317,9 @@ class MultiDexScreener:
                 f"volatility {volatility:.1f}% > max {cfg.max_volatility:.1f}% (IL risk)",
             )
 
-        # 5. Fetch active bin ID via RPC for DLMM pools
+        # 5. Fetch active bin ID via RPC for Meteora DLMM pools
         active_bin_id = 0
-        if self.rpc and pool_type.lower().startswith("concentr"):
+        if self.rpc and n.get("dex") == "meteora" and pool_type == "DLMM":
             active_bin_id = _fetch_active_bin_id(self.rpc, n.get("pool_address", ""))
 
         # 6. Protocol-neutral score, normalized to daily observations.
@@ -364,7 +365,7 @@ class MultiDexScreener:
             apr=apr,
             fee_rate=float(n.get("fee_rate") or 0.0),
             tick_spacing=tick_spacing,
-            active_bin_id=active_bin_id,
+            active_bin_id=int(active_bin_id),
             effective_tvl=breakdown.effective_tvl,
             realized_fee_apr=breakdown.realized_fee_apr,
             adjusted_apr=breakdown.adjusted_apr,
@@ -373,6 +374,13 @@ class MultiDexScreener:
             efficiency_score=breakdown.efficiency_score,
             risk_score=breakdown.risk_score,
             lp_fee_share=lp_fee_share,
+            pool_price=float(n.get("pool_price") or 0.0),
+            token_x_address=n.get("token_x_address", ""),
+            token_x_decimals=int(n.get("token_x_decimals") or 0),
+            token_x_price_usd=float(n.get("token_x_price_usd") or 0.0),
+            token_y_address=n.get("token_y_address", ""),
+            token_y_decimals=int(n.get("token_y_decimals") or 0),
+            token_y_price_usd=float(n.get("token_y_price_usd") or 0.0),
         )
         return candidate, ""
 

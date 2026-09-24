@@ -51,4 +51,4 @@ def resolve_rpc_url() -> str:
 
 def resolve_wallet(explicit: str = "") -> str:
     """Return the explicit wallet or fall back to the environment variable."""
-    return explicit or os.environ.get(WALLET_ENV, "")
+    return (explicit or os.environ.get(WALLET_ENV, "")).strip()

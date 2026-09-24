@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.request
 from typing import Any, Dict, List
 
@@ -32,13 +33,11 @@ class HttpJsonClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"API error: HTTP {response.status}")
                 data = json.loads(response.read().decode("utf-8"))
-        except Exception as exc:
+        except (urllib.error.URLError, ValueError) as exc:
             raise RuntimeError(f"GET {url[:120]} failed: {exc}") from exc
         if isinstance(data, dict) and data.get("success") is False:
-            raise RuntimeError(f"API error: {data.get('msg')}")
+            raise RuntimeError(f"API error: {data.get('msg') or 'unknown error'}")
         if not isinstance(data, dict):
             raise RuntimeError("API returned a non-object JSON payload")
         return data

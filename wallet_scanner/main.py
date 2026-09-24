@@ -89,6 +89,8 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         parser.error("--json cannot be combined with --watch")
     if args.threshold < 0:
         parser.error("--threshold cannot be negative")
+    if args.watch < 0:
+        parser.error("--watch cannot be negative")
     return args
 
 

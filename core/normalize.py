@@ -42,10 +42,13 @@ def integer(value: Any, field: str = "value") -> int:
 def token_entry(value: Any, default_address: str = "") -> Dict[str, Any]:
     """Normalize a token object into a common token_x/token_y shape."""
     data = mapping(value)
+    raw_decimals = data.get("decimals")
     return {
         "symbol": data.get("symbol", ""),
         "address": data.get("address", default_address),
-        "decimals": finite_float(data.get("decimals"), "decimals") or 9,
+        "decimals": (
+            integer(raw_decimals, "decimals") if raw_decimals is not None else 9
+        ),
         "price_usd": finite_float(data.get("price_usd"), "price_usd") or 0.0,
     }
 

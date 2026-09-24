@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import threading
 import urllib.error
@@ -71,11 +70,8 @@ class RpcClient:
             raise RuntimeError("getAccountInfo: invalid response")
         if body.get("error"):
             raise RuntimeError(f"getAccountInfo: {body['error']}")
-        result = body.get("result", {})
-        if isinstance(result, str):
-            decoded = base64.b64decode(result)
-            return {"data": decoded, "owner": ""}
-        return result
+        result = body.get("result")
+        return result if isinstance(result, dict) else {}
 
     def batch(self, calls: Iterable[Tuple[str, List[Any]]]) -> List[Any]:
         call_list = list(calls)

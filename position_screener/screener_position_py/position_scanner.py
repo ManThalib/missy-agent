@@ -87,8 +87,13 @@ class PositionScanner:
     def scan(
         self, wallet: str, dex: str = "all", history_pages: int = 0
     ) -> PositionScan:
-        if len(_b58decode(wallet)) != 32:
-            raise ValueError("wallet must be a 32-byte Solana base58 address")
+        try:
+            if len(_b58decode(wallet)) != 32:
+                raise ValueError
+        except Exception:
+            raise ValueError(
+                f"wallet must be a 32-byte Solana base58 address: {wallet!r}"
+            ) from None
         normalized_dex = dex.lower()
         supported = {"all", "meteora", "raydium", "orca"}
         if normalized_dex not in supported:

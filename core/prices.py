@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 import urllib.parse
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -46,7 +47,8 @@ class JupiterPriceClient(HttpJsonClient):
             )
             prices.update(self._parse_prices(data))
             if start + self.batch_size < len(unique):
-                self._pause()
+                if self.pause_seconds > 0:
+                    time.sleep(self.pause_seconds)
         return prices
 
     @staticmethod

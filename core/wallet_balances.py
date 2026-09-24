@@ -37,7 +37,7 @@ def ui_amount(raw_amount: str, decimals: int) -> float:
 
 def fetch_sol_balance_lamports(rpc: Any, wallet: str) -> int:
     """Return the wallet's finalized SOL balance in lamports."""
-    result = rpc.call("getBalance", [wallet, "finalized"])
+    result = rpc.call("getBalance", [wallet, {"commitment": "finalized"}])
     if isinstance(result, dict):
         return int(result.get("value", 0) or 0)
     if isinstance(result, int):
