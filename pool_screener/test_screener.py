@@ -18,7 +18,7 @@ from screener_py.screener import (
 from screener_py.token_config_parser import TokenConfigParser
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDtWv"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 
 class TestScreener(unittest.TestCase):
