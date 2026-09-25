@@ -40,6 +40,8 @@ class LiquidityPosition:
     current_value_usd: float = 0.0
     token_x_amount: Dict[str, Any] = field(default_factory=lambda: {"raw": "0", "ui": 0.0})
     token_y_amount: Dict[str, Any] = field(default_factory=lambda: {"raw": "0", "ui": 0.0})
+    token_x_price_usd: float = 0.0
+    token_y_price_usd: float = 0.0
 
     @property
     def has_claimable(self) -> bool:

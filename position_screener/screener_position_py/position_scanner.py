@@ -20,6 +20,7 @@ from core.wallet_balances import (
 from .helius_history_client import HeliusHistoryClient
 from .helius_parser import HeliusWebhookParser
 from .helius_types import NormalizedTransaction, ParsedInstruction
+from .enrichment import enrich_positions
 from .liquidity_position import LiquidityPosition
 from .position_scan import PositionScan
 from .rpc_client import RpcClient
@@ -170,6 +171,7 @@ class PositionScanner:
             )
 
         merged = self._merge_positions(current, historical)
+        enrich_positions(merged)
         merged.sort(
             key=lambda item: (
                 item.dex,
@@ -409,7 +411,8 @@ class PositionScanner:
             liquidity_raw=liquidity,
             lower_bound=struct.unpack_from("<i", data, 88)[0],
             upper_bound=struct.unpack_from("<i", data, 92)[0],
-            fees_owed_raw=[_u64(data, 108), _u64(data, 132)],
+            # Orca Position layout: fee_owed_a/b at offsets 128/136.
+            fees_owed_raw=[_u64(data, 128), _u64(data, 136)],
             rewards_owed_raw=rewards,
             source="solana_rpc",
         )

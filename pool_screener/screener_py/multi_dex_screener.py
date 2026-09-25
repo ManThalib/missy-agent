@@ -16,6 +16,8 @@ from .normalize_utils import (
 )
 from .scoring import PoolScoreInput, PoolScorer
 from .whitelist import Whitelist, normalize_symbol
+from core.prices import JupiterPriceClient
+
 
 __all__ = [
     "RaydiumScreener",
@@ -82,14 +84,22 @@ def _yield_over_tvl_apr(fee_usd: float, tvl_usd: float, window: str) -> float:
     return (fee_usd / tvl_usd) * 100.0 * (365.0 / days)
 
 
-def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
+def _apply_price_map(token_data: Dict[str, Any], price_map: Dict[str, float]) -> Dict[str, Any]:
+    address = token_data.get("address")
+    if address and address in price_map:
+        token_data = dict(token_data)
+        token_data["price_usd"] = price_map[address]
+    return token_data
+
+
+def normalize_pool(pool: Dict[str, Any], window: str = "day", price_map: Dict[str, float] = None) -> Dict[str, Any]:
     """Converts a provider pool into the common shape used by the screener."""
     if not isinstance(pool, dict):
         raise ValueError("pool payload must be an object")
 
     if "mintA" in pool or "mintB" in pool:
-        mint_a = mapping(pool.get("mintA"))
-        mint_b = mapping(pool.get("mintB"))
+        mint_a = _apply_price_map(mapping(pool.get("mintA")), price_map or {})
+        mint_b = _apply_price_map(mapping(pool.get("mintB")), price_map or {})
         token_x = token_entry(mint_a)
         token_y = token_entry(mint_b)
         name = f"{mint_a.get('symbol', '?')}-{mint_b.get('symbol', '?')}"
@@ -143,10 +153,12 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
 
     if pool.get("_dex") == "orca" or "tvlUsdc" in pool:
         token_a = token_entry(
-            pool.get("tokenA"), default_address=pool.get("tokenMintA", "")
+            _apply_price_map(mapping(pool.get("tokenA")), price_map or {}),
+            default_address=pool.get("tokenMintA", ""),
         )
         token_b = token_entry(
-            pool.get("tokenB"), default_address=pool.get("tokenMintB", "")
+            _apply_price_map(mapping(pool.get("tokenB")), price_map or {}),
+            default_address=pool.get("tokenMintB", ""),
         )
         timeframe = _ORCA_TIMEFRAMES.get(window, "24h")
         stats = mapping(mapping(pool.get("stats")).get(timeframe))
@@ -168,7 +180,11 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
         fee_rate = finite_float(pool.get("feeRate"), "fee rate") / 1_000_000.0
         tick_spacing = integer(pool.get("tickSpacing"), "tick spacing")
         current_tick_index = integer(
-            pool.get("tickCurrentIndex") or 0, "tickCurrentIndex"
+            pool.get("tickCurrentIndex")
+            or pool.get("currentTickIndex")
+            or pool.get("current_tick_index")
+            or 0,
+            "tickCurrentIndex",
         )
         return {
             "dex": "orca",
@@ -225,8 +241,8 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
         ) or "volatility" in pool
         if "volatility" in pool and normalized["volatility"] == 0.0:
             normalized["volatility"] = finite_float(pool.get("volatility"), "volatility")
-        token_x = token_entry(pool.get("token_x"))
-        token_y = token_entry(pool.get("token_y"))
+        token_x = token_entry(_apply_price_map(mapping(pool.get("token_x")), price_map or {}))
+        token_y = token_entry(_apply_price_map(mapping(pool.get("token_y")), price_map or {}))
         normalized["token_x"] = token_x
         normalized["token_y"] = token_y
         normalized.update(top_level_token_metadata(token_x, token_y))
@@ -254,8 +270,62 @@ class MultiDexScreener:
         self.rpc = rpc
         self.scorer = PoolScorer()
 
-    def screen_pool(self, p: Dict[str, Any]) -> Tuple[Optional[Candidate], str]:
-        n = normalize_pool(p, window=self.config.window)
+    def _fetch_pool_prices(
+        self, pools: List[Dict[str, Any]]
+    ) -> Dict[str, float]:
+        """Collect token mints from raw pools and fetch Jupiter USD prices."""
+        mints: set = set()
+        for pool in pools:
+            n = normalize_pool(pool, window=self.config.window)
+            for key in ("token_x", "token_y"):
+                token = n.get(key) or {}
+                address = token.get("address")
+                if address:
+                    mints.add(address)
+        if not mints:
+            return {}
+        try:
+            return JupiterPriceClient().fetch_prices(mints)
+        except Exception:
+            return {}
+
+    def _inject_token_prices(
+        self, pool: Dict[str, Any], price_map: Dict[str, float]
+    ) -> None:
+        """Mutate a raw pool payload so its token objects carry USD prices."""
+        if not price_map:
+            return
+
+        def _apply(token_obj: Any, price: float) -> None:
+            if isinstance(token_obj, dict):
+                token_obj["price_usd"] = price
+
+        for key in ("token_x", "token_y"):
+            address = None
+            # Try normalized shape first
+            n = normalize_pool(pool, window=self.config.window)
+            token = n.get(key) or {}
+            address = token.get("address")
+            if not address or address not in price_map:
+                continue
+            price = price_map[address]
+            if key == "token_x":
+                if "token_x" in pool:
+                    _apply(pool.get("token_x"), price)
+                if "mintA" in pool:
+                    _apply(pool.get("mintA"), price)
+                if "tokenA" in pool:
+                    _apply(pool.get("tokenA"), price)
+            else:
+                if "token_y" in pool:
+                    _apply(pool.get("token_y"), price)
+                if "mintB" in pool:
+                    _apply(pool.get("mintB"), price)
+                if "tokenB" in pool:
+                    _apply(pool.get("tokenB"), price)
+
+    def screen_pool(self, p: Dict[str, Any], price_map: Dict[str, float] = None) -> Tuple[Optional[Candidate], str]:
+        n = normalize_pool(p, window=self.config.window, price_map=price_map)
         token_x = n.get("token_x") or {}
         token_y = n.get("token_y") or {}
 
@@ -403,9 +473,10 @@ class MultiDexScreener:
     ) -> Tuple[List[Candidate], Dict[str, int]]:
         candidates: List[Candidate] = []
         rejects: Dict[str, int] = {}
+        price_map = self._fetch_pool_prices(pools)
         for pool in pools:
             try:
-                candidate, reason = self.screen_pool(pool)
+                candidate, reason = self.screen_pool(pool, price_map=price_map)
             except (TypeError, ValueError, OverflowError) as exc:
                 reason = f"invalid provider payload: {exc}"
                 candidate = None
