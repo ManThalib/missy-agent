@@ -234,7 +234,7 @@ class TestScreener(unittest.TestCase):
     def test_token_object_uses_first_valid_string_value(self):
         self.assertEqual(
             TokenConfigParser._parse_entry({"symbol": None, "address": SOL_MINT}),
-            SOL_MINT,
+            [SOL_MINT],
         )
 
     def test_config_from_args_includes_discovery_fields(self):

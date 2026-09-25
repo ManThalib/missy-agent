@@ -18,7 +18,7 @@ from .constants import (
 )
 from .display import truncate
 from .helius import HeliusHistoryClient
-from .http import HttpJsonClient
+from .http_client import HttpJsonClient
 from .normalize import finite_float, integer, mapping, safe_get, token_entry, top_level_token_metadata
 from .prices import JupiterPriceClient
 from .rpc import RpcClient

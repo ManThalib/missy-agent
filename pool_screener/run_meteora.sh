@@ -9,10 +9,10 @@ LOG=/data/missy-data/pool_screens/cron.log
 export TZ=Asia/Shanghai
 
 # Enable on-chain active-bin / current-tick enrichment.
-# SOLANA_RPC_URL should be exported by the caller (automation / cron) so the
-# Helius API key is not committed. If it is not set, fall back to position
-# scanner's URL (kept there for backwards compatibility).
-export SOLANA_RPC_URL="${SOLANA_RPC_URL:-https://mainnet.helius-rpc.com/?api-key=589aa80f-d429-43c4-b6dd-c060771c6acf}"
+# SOLANA_RPC_URL should be exported by the caller (automation / cron).
+# Falls back to the OpenClaw shared store env value.
+: "${HELIUS_API_KEY:?HELIUS_API_KEY is required}"
+export SOLANA_RPC_URL="${SOLANA_RPC_URL:-https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}}"
 
 mkdir -p "$OUTDIR"
 TS=$(date +%Y%m%d-%H%M%S)

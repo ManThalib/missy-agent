@@ -8,7 +8,7 @@ import urllib.parse
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .constants import JUPITER_PRICE_V2_URL
-from .http import HttpJsonClient
+from .http_client import HttpJsonClient
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_PAUSE_SECONDS = 0.15

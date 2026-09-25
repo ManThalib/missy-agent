@@ -18,6 +18,7 @@ SYMBOL_ALIASES = {
     "WBTC": "BTC",
     "XBTC": "BTC",
     "CBBTC": "BTC",
+    "CBXRP": "XRP",
 }
 SYMBOL_TO_MINT = {symbol: mint for mint, symbol in MINT_TO_SYMBOL.items()}
 QUOTE_PAIRS = {'"': '"', "'": "'", "`": "`"}

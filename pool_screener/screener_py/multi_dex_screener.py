@@ -74,6 +74,14 @@ def _volatility(price: float, price_min: float, price_max: float) -> float:
     return 0.0
 
 
+def _yield_over_tvl_apr(fee_usd: float, tvl_usd: float, window: str) -> float:
+    """Annualize fee/tvl the same way Orca does for 24h/7d/30d windows."""
+    if tvl_usd <= 0.0 or fee_usd <= 0.0:
+        return 0.0
+    days = _WINDOW_DAYS.get(window, 1.0)
+    return (fee_usd / tvl_usd) * 100.0 * (365.0 / days)
+
+
 def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
     """Converts a provider pool into the common shape used by the screener."""
     if not isinstance(pool, dict):
@@ -93,9 +101,12 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
         period = mapping(pool.get(window) or pool.get("day"))
         volume = finite_float(period.get("volume"), "volume")
         volume_fee = finite_float(period.get("volumeFee"), "fees")
-        apr = finite_float(period.get("apr"), "APR")
-        if not apr:
-            apr = finite_float(period.get("feeApr"), "fee APR")
+        reported_apr = finite_float(period.get("apr"), "APR") or finite_float(
+            period.get("feeApr"), "fee APR"
+        )
+        apr = _yield_over_tvl_apr(volume_fee, tvl, window)
+        if not apr and reported_apr:
+            apr = reported_apr
         price = finite_float(pool.get("price"), "price")
         price_min = finite_float(period.get("priceMin"), "minimum price")
         price_max = finite_float(period.get("priceMax"), "maximum price")
@@ -199,6 +210,9 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
         normalized["bin_step"] = normalized["tick_spacing"]
         for field in ("tvl", "fee", "volume", "apr", "fee_pct"):
             normalized[field] = finite_float(pool.get(field), field)
+        normalized["apr"] = _yield_over_tvl_apr(
+            normalized["fee"], normalized["tvl"], window
+        )
         normalized.setdefault("fee_rate", normalized["fee_pct"] / 100.0)
         current_price = finite_float(
             pool.get("pool_price", pool.get("price")), "price"
@@ -211,8 +225,8 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day") -> Dict[str, Any]:
         ) or "volatility" in pool
         if "volatility" in pool and normalized["volatility"] == 0.0:
             normalized["volatility"] = finite_float(pool.get("volatility"), "volatility")
-        token_x = token_entry(pool.get("tokenX"))
-        token_y = token_entry(pool.get("tokenY"))
+        token_x = token_entry(pool.get("token_x"))
+        token_y = token_entry(pool.get("token_y"))
         normalized["token_x"] = token_x
         normalized["token_y"] = token_y
         normalized.update(top_level_token_metadata(token_x, token_y))

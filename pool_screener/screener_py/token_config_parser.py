@@ -36,22 +36,32 @@ class TokenConfigParser:
             entries = [entries]
         if not isinstance(entries, list):
             return []
-        return [
-            token for token in (cls._parse_entry(entry) for entry in entries) if token
-        ]
+        result: List[str] = []
+        for entry in entries:
+            result.extend(cls._parse_entry(entry))
+        return result
 
-    @staticmethod
-    def _parse_entry(entry: Any) -> str:
-        value = entry
-        if isinstance(entry, dict):
-            value = next(
-                (
-                    entry[key]
-                    for key in TOKEN_VALUE_KEYS
-                    if isinstance(entry.get(key), str) and entry[key].strip()
-                ),
-                "",
-            )
-        if not isinstance(value, str):
-            return ""
-        return clean_token_literal(value)
+    @classmethod
+    def _parse_entry(cls, entry: Any) -> List[str]:
+        if isinstance(entry, str):
+            cleaned = clean_token_literal(entry)
+            return [cleaned] if cleaned else []
+        if not isinstance(entry, dict):
+            return []
+
+        values: List[str] = []
+        for key in TOKEN_VALUE_KEYS:
+            if isinstance(entry.get(key), str) and entry[key].strip():
+                cleaned = clean_token_literal(entry[key])
+                if cleaned:
+                    values.append(cleaned)
+
+        aliases = entry.get("aliases")
+        if isinstance(aliases, list):
+            for alias in aliases:
+                if isinstance(alias, str) and alias.strip():
+                    cleaned = clean_token_literal(alias)
+                    if cleaned and cleaned not in values:
+                        values.append(cleaned)
+
+        return values

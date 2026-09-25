@@ -74,24 +74,39 @@ class WalletScanner:
 
 
 def _parse_token_account(account: Any) -> Optional[TokenBalance]:
-    """Map a shared ``core.wallet_balances`` record into a ``TokenBalance``."""
+    """Map a Solana jsonParsed token account into a ``TokenBalance``."""
     if not isinstance(account, dict):
         return None
-    mint = account.get("mint")
+    account = dict(account)
+    parsed_info = _safe_parsed_info(account)
+    mint = parsed_info.get("mint") or account.get("mint")
     if not mint:
         return None
+    token_amount = parsed_info.get("tokenAmount") or {}
     try:
-        decimals = int(account.get("decimals", 0) or 0)
+        decimals = int(token_amount.get("decimals", account.get("decimals", 0)) or 0)
     except (TypeError, ValueError):
         decimals = 0
     try:
-        ui_amount = float(account.get("ui_amount", 0.0) or 0.0)
+        raw_ui = token_amount.get("uiAmount", account.get("ui_amount", 0.0))
+        if raw_ui is None:
+            raw_ui = 0.0
+        ui_amount = float(raw_ui)
     except (TypeError, ValueError):
         ui_amount = 0.0
+    raw_amount = token_amount.get("amount", account.get("raw_amount", "0"))
     return TokenBalance(
         mint=mint,
         symbol="wSOL" if mint == WRAPPED_SOL_MINT else account.get("symbol", ""),
         decimals=decimals,
-        amount_raw=str(account.get("raw_amount", "0")),
+        amount_raw=str(raw_amount),
         amount_ui=ui_amount,
     )
+
+
+def _safe_parsed_info(account: dict) -> dict:
+    """Return the parsed info block from a Solana jsonParsed token account."""
+    try:
+        return account["account"]["data"]["parsed"]["info"]
+    except (KeyError, TypeError):
+        return {}
