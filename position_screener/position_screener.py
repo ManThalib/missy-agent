@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 import time
+import traceback
 
 from screener_position_py import PositionScanner
 from screener_position_py.analytics.closure_state import scan_closure_state
@@ -76,6 +77,8 @@ def main() -> int:
                 history_pages=args.position_history_pages,
             )
         except Exception as exc:
+            # Full stack goes to stderr (cron.log) so failures carry context.
+            traceback.print_exc()
             print(f"Error during position scan: {exc}", file=sys.stderr)
             return False
 

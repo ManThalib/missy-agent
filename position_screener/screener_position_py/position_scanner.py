@@ -171,7 +171,7 @@ class PositionScanner:
             )
 
         merged = self._merge_positions(current, historical)
-        enrich_positions(merged)
+        enrich_positions(merged, errors)
         merged.sort(
             key=lambda item: (
                 item.dex,

@@ -49,14 +49,33 @@ def _token_prices(pool: Dict[str, Any]) -> tuple:
     return px, py, dx, dy
 
 
+def _safe_exp(value: float) -> float:
+    """math.exp without OverflowError: clamp to float exp bounds.
+
+    Arguments beyond ~709.78 overflow and below ~-745 underflow; absurd
+    tick/bin values from anomalous pool records must degrade to inf/0.0
+    instead of raising and killing the scan.
+    """
+    if value >= 709.78:
+        return math.inf
+    if value <= -745.0:
+        return 0.0
+    return math.exp(value)
+
+
+def _finite_or_zero(value: float) -> float:
+    """Map non-finite enrichment values (inf/nan) to 0.0 for valid JSON."""
+    return value if math.isfinite(value) else 0.0
+
+
 def _tick_to_price_ratio(tick: int) -> float:
     """CLMM sqrt-price ratio for a tick. Scale cancels in comparisons."""
-    return math.exp(tick * math.log(1.0001) / 2.0)
+    return _safe_exp(tick * math.log(1.0001) / 2.0)
 
 
 def _bin_to_price_ratio(bin_id: int, bin_step: int) -> float:
     """Meteora DLMM relative price for a bin id."""
-    return math.exp(bin_id * math.log(1.0 + bin_step / 10000.0))
+    return _safe_exp(bin_id * math.log(1.0 + bin_step / 10000.0))
 
 
 def _clmm_amounts(liquidity_raw: int, current_tick: int, lower: int, upper: int) -> tuple:
@@ -66,6 +85,9 @@ def _clmm_amounts(liquidity_raw: int, current_tick: int, lower: int, upper: int)
     sqrt_p = _tick_to_price_ratio(current_tick)
     sqrt_pl = _tick_to_price_ratio(lower)
     sqrt_pu = _tick_to_price_ratio(upper)
+    if not all(math.isfinite(r) for r in (sqrt_p, sqrt_pl, sqrt_pu)):
+        # Garbage tick data (overflowed ratios): amounts are meaningless.
+        return 0.0, 0.0
     L = liquidity_raw
 
     if current_tick <= lower:
@@ -106,7 +128,8 @@ def _derive_current_tick(pool: Dict[str, Any]) -> int:
     dec_y = int(pool.get("token_y_decimals") or 0)
     if pool_price > 0 and dec_x > 0 and dec_y > 0:
         raw_price = pool_price * (10 ** (dec_y - dec_x))
-        return int(math.log(raw_price) / math.log(1.0001))
+        if raw_price > 0:
+            return int(math.log(raw_price) / math.log(1.0001))
     return 0
 
 
@@ -162,8 +185,142 @@ def _compute_fees(position: LiquidityPosition, pool: Dict[str, Any]) -> float:
     return fx + fy
 
 
-def enrich_positions(positions: List[LiquidityPosition]) -> None:
-    """Mutate positions in place with pool-derived prices and USD values."""
+def _enrich_one(
+    position: LiquidityPosition, pools: Dict[str, Dict[str, Any]], now: float
+) -> None:
+    """Enrich a single position; raises so the caller can isolate failures."""
+    pool = pools.get(position.pool_address)
+    if not pool:
+        return
+
+    px, py, _, _ = _token_prices(pool)
+    position.token_x_price_usd = px
+    position.token_y_price_usd = py
+    position.token_x_amount = {"raw": str(position.liquidity_raw), "ui": 0.0}
+    position.token_y_amount = {"raw": str(position.liquidity_raw), "ui": 0.0}
+
+    if position.dex in ("orca", "raydium"):
+        pool_price = float(pool.get("pool_price") or 0.0)
+        dec_x = int(pool.get("token_x_decimals") or 0)
+        dec_y = int(pool.get("token_y_decimals") or 0)
+        current_tick = int(
+            pool.get("current_tick_index")
+            or pool.get("active_bin_id")
+            or 0
+        )
+        # Orca API does not always expose current_tick_index; derive it from
+        # the human pool price so bounds are on the same scale as the price.
+        if current_tick == 0 and pool_price > 0 and dec_x > 0 and dec_y > 0:
+            raw_price = pool_price * (10 ** (dec_y - dec_x))
+            if raw_price > 0:
+                current_tick = int(math.log(raw_price) / math.log(1.0001))
+
+        if pool_price > 0 and current_tick != 0:
+            position.current_price = pool_price
+            lower_delta = (position.lower_bound or 0) - current_tick
+            upper_delta = (position.upper_bound or 0) - current_tick
+            position.lower_price = _finite_or_zero(
+                pool_price * _safe_exp(lower_delta * math.log(1.0001))
+            )
+            position.upper_price = _finite_or_zero(
+                pool_price * _safe_exp(upper_delta * math.log(1.0001))
+            )
+        else:
+            position.current_price = _finite_or_zero(
+                _tick_to_price_ratio(current_tick)
+            )
+            position.lower_price = _finite_or_zero(
+                _tick_to_price_ratio(position.lower_bound or 0)
+            )
+            position.upper_price = _finite_or_zero(
+                _tick_to_price_ratio(position.upper_bound or 0)
+            )
+        position.in_range = (
+            position.lower_bound is not None
+            and position.upper_bound is not None
+            and (position.lower_bound <= current_tick <= position.upper_bound)
+        )
+    elif position.dex == "meteora":
+        bin_step = int(pool.get("bin_step") or pool.get("tick_spacing") or 0)
+        active_bin = int(pool.get("active_bin_id") or 0)
+        lower = position.lower_bound or 0
+        upper = position.upper_bound or 0
+        pool_price = float(pool.get("pool_price") or 0.0)
+        if bin_step > 0:
+            if pool_price > 0:
+                # Prefer the human pool price: it already carries the
+                # decimal adjustment, and recorded bin ids can be
+                # anomalous (a bad active_bin_id must not poison price
+                # math). Bound prices scale relative to the active bin.
+                log_bin = math.log(1.0 + bin_step / 10000.0)
+                position.current_price = pool_price
+                position.lower_price = _finite_or_zero(
+                    pool_price * _safe_exp((lower - active_bin) * log_bin)
+                )
+                position.upper_price = _finite_or_zero(
+                    pool_price * _safe_exp((upper - active_bin) * log_bin)
+                )
+            else:
+                position.current_price = _finite_or_zero(
+                    _bin_to_price_ratio(active_bin, bin_step)
+                )
+                position.lower_price = _finite_or_zero(
+                    _bin_to_price_ratio(lower, bin_step)
+                )
+                position.upper_price = _finite_or_zero(
+                    _bin_to_price_ratio(upper, bin_step)
+                )
+        else:
+            position.current_price = float(active_bin)
+            position.lower_price = float(lower)
+            position.upper_price = float(upper)
+        current_bin = active_bin
+        position.in_range = lower <= current_bin <= upper
+
+    position.fees_usd = _compute_fees(position, pool)
+    position.current_value_usd = _compute_value(position, pool)
+    _dx = int(pool.get("token_x_decimals") or 0)
+    _dy = int(pool.get("token_y_decimals") or 0)
+    _amount_x, _amount_y = _position_amounts(position, pool)
+    position.token_x_amount = {
+        "raw": str(int(_amount_x)) if _amount_x > 0 else "0",
+        "ui": _amount_x / (10 ** _dx) if _dx > 0 and _amount_x > 0 else 0.0,
+    }
+    position.token_y_amount = {
+        "raw": str(int(_amount_y)) if _amount_y > 0 else "0",
+        "ui": _amount_y / (10 ** _dy) if _dy > 0 and _amount_y > 0 else 0.0,
+    }
+    position.days_open = 0.0
+    if position.opened_at:
+        position.days_open = max(0.0, (now - position.opened_at) / 86400.0)
+
+    # Store token prices in pool_enrichment for consumers that look there.
+    if position.pool_enrichment is None:
+        position.pool_enrichment = {}
+    position.pool_enrichment.update(
+        {
+            "token_x_price_usd": px,
+            "token_y_price_usd": py,
+            "position_value_usd": position.current_value_usd,
+            "current_price": position.current_price,
+            "lower_price": position.lower_price,
+            "upper_price": position.upper_price,
+            "fees_usd": position.fees_usd,
+            "current_value_usd": position.current_value_usd,
+            "days_open": position.days_open,
+        }
+    )
+
+
+def enrich_positions(
+    positions: List[LiquidityPosition],
+    errors: Optional[Dict[str, str]] = None,
+) -> None:
+    """Mutate positions in place with pool-derived prices and USD values.
+
+    A failure while enriching one position is recorded (into ``errors`` when
+    provided, and on the position itself) and must not abort the scan.
+    """
     scan_path = _latest_pool_scan()
     if not scan_path:
         return
@@ -171,92 +328,13 @@ def enrich_positions(positions: List[LiquidityPosition]) -> None:
     now = time.time()
 
     for position in positions:
-        pool = pools.get(position.pool_address)
-        if not pool:
-            continue
-
-        px, py, _, _ = _token_prices(pool)
-        position.token_x_price_usd = px
-        position.token_y_price_usd = py
-        position.token_x_amount = {"raw": str(position.liquidity_raw), "ui": 0.0}
-        position.token_y_amount = {"raw": str(position.liquidity_raw), "ui": 0.0}
-
-        if position.dex in ("orca", "raydium"):
-            pool_price = float(pool.get("pool_price") or 0.0)
-            dec_x = int(pool.get("token_x_decimals") or 0)
-            dec_y = int(pool.get("token_y_decimals") or 0)
-            current_tick = int(
-                pool.get("current_tick_index")
-                or pool.get("active_bin_id")
-                or 0
-            )
-            # Orca API does not always expose current_tick_index; derive it from
-            # the human pool price so bounds are on the same scale as the price.
-            if current_tick == 0 and pool_price > 0 and dec_x > 0 and dec_y > 0:
-                raw_price = pool_price * (10 ** (dec_y - dec_x))
-                current_tick = int(math.log(raw_price) / math.log(1.0001))
-
-            if pool_price > 0 and current_tick != 0:
-                position.current_price = pool_price
-                lower_delta = (position.lower_bound or 0) - current_tick
-                upper_delta = (position.upper_bound or 0) - current_tick
-                position.lower_price = pool_price * math.exp(lower_delta * math.log(1.0001))
-                position.upper_price = pool_price * math.exp(upper_delta * math.log(1.0001))
-            else:
-                position.current_price = _tick_to_price_ratio(current_tick)
-                position.lower_price = _tick_to_price_ratio(position.lower_bound or 0)
-                position.upper_price = _tick_to_price_ratio(position.upper_bound or 0)
-            position.in_range = (
-                position.lower_bound is not None
-                and position.upper_bound is not None
-                and (position.lower_bound <= current_tick <= position.upper_bound)
-            )
-        elif position.dex == "meteora":
-            bin_step = int(pool.get("bin_step") or pool.get("tick_spacing") or 0)
-            active_bin = int(pool.get("active_bin_id") or 0)
-            lower = position.lower_bound or 0
-            upper = position.upper_bound or 0
-            if bin_step > 0:
-                position.current_price = _bin_to_price_ratio(active_bin, bin_step)
-                position.lower_price = _bin_to_price_ratio(lower, bin_step)
-                position.upper_price = _bin_to_price_ratio(upper, bin_step)
-            else:
-                position.current_price = float(active_bin)
-                position.lower_price = float(lower)
-                position.upper_price = float(upper)
-            current_bin = active_bin
-            position.in_range = lower <= current_bin <= upper
-
-        position.fees_usd = _compute_fees(position, pool)
-        position.current_value_usd = _compute_value(position, pool)
-        _dx = int(pool.get("token_x_decimals") or 0)
-        _dy = int(pool.get("token_y_decimals") or 0)
-        _amount_x, _amount_y = _position_amounts(position, pool)
-        position.token_x_amount = {
-            "raw": str(int(_amount_x)) if _amount_x > 0 else "0",
-            "ui": _amount_x / (10 ** _dx) if _dx > 0 and _amount_x > 0 else 0.0,
-        }
-        position.token_y_amount = {
-            "raw": str(int(_amount_y)) if _amount_y > 0 else "0",
-            "ui": _amount_y / (10 ** _dy) if _dy > 0 and _amount_y > 0 else 0.0,
-        }
-        position.days_open = 0.0
-        if position.opened_at:
-            position.days_open = max(0.0, (now - position.opened_at) / 86400.0)
-
-        # Store token prices in pool_enrichment for consumers that look there.
-        if position.pool_enrichment is None:
-            position.pool_enrichment = {}
-        position.pool_enrichment.update(
-            {
-                "token_x_price_usd": px,
-                "token_y_price_usd": py,
-                "position_value_usd": position.current_value_usd,
-                "current_price": position.current_price,
-                "lower_price": position.lower_price,
-                "upper_price": position.upper_price,
-                "fees_usd": position.fees_usd,
-                "current_value_usd": position.current_value_usd,
-                "days_open": position.days_open,
-            }
-        )
+        try:
+            _enrich_one(position, pools, now)
+        except Exception as exc:
+            # One bad pool record must not kill the whole scan.
+            if position.pool_enrichment is None:
+                position.pool_enrichment = {}
+            position.pool_enrichment["enrichment_error"] = str(exc)
+            if errors is not None:
+                key = position.pool_address or position.position_address
+                errors[f"enrichment:{key}"] = str(exc)

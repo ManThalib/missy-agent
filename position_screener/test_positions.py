@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Unit tests for wallet position decoding and candidate enrichment."""
 
+import json
+import math
 import struct
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from unittest import mock
 from unittest.mock import Mock
 
 from screener_position_py import (
     ClosureState,
     LiquidityPosition,
     attach_positions,
+    enrichment,
 )
 from screener_position_py.analytics.scoring import (
     PositionScoreBreakdown,
@@ -704,6 +708,111 @@ class TestTraderPerformanceScorer(unittest.TestCase):
 
         self.assertGreater(clean_result.adjusted_pnl, dust_result.adjusted_pnl)
         self.assertGreater(clean_result.final_score, dust_result.final_score)
+
+
+class TestEnrichmentGuardrails(unittest.TestCase):
+    """Enrichment must survive absurd tick/bin values in pool records."""
+
+    def _write_pool_scan(self, pools):
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False
+        ) as handle:
+            json.dump({"pools": pools}, handle)
+            return handle.name
+
+    def _meteora_pool_record(self, **overrides):
+        record = {
+            "pool_address": "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",
+            "dex": "meteora",
+            "pool_price": 120.61,
+            "active_bin_id": 1976080,
+            "bin_step": 4,
+            "token_x_price_usd": 120.54,
+            "token_y_price_usd": 1.0,
+            "token_x_decimals": 9,
+            "token_y_decimals": 6,
+        }
+        record.update(overrides)
+        return record
+
+    def test_bin_ratio_overflow_does_not_raise(self):
+        # exp(1976080 * log(1.0004)) overflowed before the guard existed.
+        ratio = enrichment._bin_to_price_ratio(1976080, 4)
+        self.assertFalse(math.isfinite(ratio))
+        self.assertEqual(enrichment._finite_or_zero(ratio), 0.0)
+        self.assertEqual(enrichment._finite_or_zero(enrichment._tick_to_price_ratio(10**9)), 0.0)
+
+    def test_clmm_amounts_reject_garbage_tick(self):
+        amount_x, amount_y = enrichment._clmm_amounts(1000, 10**8, -10, 10)
+        self.assertEqual((amount_x, amount_y), (0.0, 0.0))
+
+    def test_enrich_survives_poisoned_active_bin(self):
+        path = self._write_pool_scan([self._meteora_pool_record()])
+        position = LiquidityPosition(
+            dex="meteora",
+            position_address="ENy8aX1tgb8tkbMvy2QLJk8ZeoBhtSooDsraTgKpUFeU",
+            pool_address="5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",
+            status="closed",
+            liquidity_raw=0,
+            lower_bound=None,
+            upper_bound=None,
+        )
+        errors = {}
+        with mock.patch.object(enrichment, "_latest_pool_scan", return_value=path):
+            enrichment.enrich_positions([position], errors)
+        # Current price comes from the human pool price, not the poisoned bin.
+        self.assertEqual(position.current_price, 120.61)
+        self.assertTrue(
+            all(
+                math.isfinite(value)
+                for value in (
+                    position.current_price,
+                    position.lower_price,
+                    position.upper_price,
+                    position.current_value_usd,
+                )
+            )
+        )
+        self.assertEqual(errors, {})
+
+    def test_enrich_isolates_per_position_failure(self):
+        path = self._write_pool_scan(
+            [
+                self._meteora_pool_record(),
+                self._meteora_pool_record(
+                    pool_address="Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
+                    dex="orca",
+                    active_bin_id=0,
+                ),
+            ]
+        )
+        poisoned = LiquidityPosition(
+            dex="meteora",
+            position_address="pos-1",
+            pool_address="5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",
+        )
+        healthy = LiquidityPosition(
+            dex="orca",
+            position_address="pos-2",
+            pool_address="Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
+            lower_bound=0,
+            upper_bound=100,
+        )
+        errors = {}
+        original = enrichment._compute_value
+
+        def explode(position, pool):
+            if position is poisoned:
+                raise RuntimeError("boom")
+            return original(position, pool)
+
+        with mock.patch.object(enrichment, "_latest_pool_scan", return_value=path):
+            with mock.patch.object(enrichment, "_compute_value", side_effect=explode):
+                enrichment.enrich_positions([poisoned, healthy], errors)
+        self.assertIn("enrichment_error", poisoned.pool_enrichment)
+        self.assertEqual(errors["enrichment:5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6"], "boom")
+        # The healthy position was still enriched.
+        self.assertTrue(healthy.pool_enrichment.get("current_price") > 0)
 
 
 if __name__ == "__main__":
