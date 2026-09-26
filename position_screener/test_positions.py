@@ -77,9 +77,9 @@ class TestPositions(unittest.TestCase):
         data[40:72] = mint
         data[72:88] = (123).to_bytes(16, "little")
         struct.pack_into("<ii", data, 88, -64, 128)
-        data[108:116] = (7).to_bytes(8, "little")
-        data[132:140] = (9).to_bytes(8, "little")
-        data[156:164] = (11).to_bytes(8, "little")
+        data[112:120] = (7).to_bytes(8, "little")
+        data[136:144] = (9).to_bytes(8, "little")
+        data[160:168] = (11).to_bytes(8, "little")
 
         position = PositionScanner._decode_orca("position", bytes(data))
 

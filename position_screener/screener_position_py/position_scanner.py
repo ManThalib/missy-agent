@@ -401,7 +401,8 @@ class PositionScanner:
         if len(data) < 216 or data[:8] != _discriminator("Position"):
             return None
         liquidity = _u128(data, 72)
-        rewards = [_u64(data, 156 + index * 24) for index in range(3)]
+        # reward_infos start at 144; each entry is growth u128 + amount_owed u64.
+        rewards = [_u64(data, 144 + index * 24 + 16) for index in range(3)]
         return LiquidityPosition(
             dex="orca",
             position_address=address,
@@ -411,8 +412,8 @@ class PositionScanner:
             liquidity_raw=liquidity,
             lower_bound=struct.unpack_from("<i", data, 88)[0],
             upper_bound=struct.unpack_from("<i", data, 92)[0],
-            # Orca Position layout: fee_owed_a/b at offsets 128/136.
-            fees_owed_raw=[_u64(data, 128), _u64(data, 136)],
+            # Orca Position layout: fee_owed_a/b at offsets 112/136.
+            fees_owed_raw=[_u64(data, 112), _u64(data, 136)],
             rewards_owed_raw=rewards,
             source="solana_rpc",
         )
