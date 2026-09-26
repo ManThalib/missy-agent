@@ -8,6 +8,7 @@ from tempfile import NamedTemporaryFile
 from unittest.mock import Mock
 
 from screener_py.client import MultiDexClient
+from screener_py.multi_dex_screener import _decode_active_bin_id
 from screener_py.scoring import PoolScoreInput, PoolScorer
 from screener_py.screener import (
     FilterConfig,
@@ -217,6 +218,46 @@ class TestScreener(unittest.TestCase):
         normalized = normalize_pool(pool)
         self.assertEqual(normalized["dex"], "meteora")
         self.assertEqual(normalized["tick_spacing"], 20)
+
+    def test_meteora_normalization_preserves_active_bin_id(self):
+        pool = {
+            "_dex": "meteora",
+            "pool_address": "MeteoraPool111111111111111111111111111111",
+            "token_x": {"symbol": "SOL", "address": SOL_MINT},
+            "token_y": {"symbol": "USDC", "address": USDC_MINT},
+            "dlmm_params": {"bin_step": 4},
+            "active_bin_id": -5289,
+        }
+        normalized = normalize_pool(pool)
+        self.assertEqual(normalized["active_bin_id"], -5289)
+
+    def test_meteora_active_bin_decode_reads_i32_at_offset_76(self):
+        # LbPair layout after the 8-byte anchor discriminator:
+        # 32B StaticParameters | 32B VariableParameters | bumpSeed [u8;1]
+        # | binStepSeed [u8;2] | pairType u8 | activeId i32 @76 | binStep u16 @80.
+        data = bytearray(904)
+        data[8:12] = (10000).to_bytes(2, "little") + (30).to_bytes(2, "little")
+        data[76:80] = (-5289).to_bytes(4, "little", signed=True)
+        data[80:82] = (4).to_bytes(2, "little")
+        self.assertEqual(_decode_active_bin_id(bytes(data)), -5289)
+
+    def test_meteora_active_bin_decode_ignores_offset8_fee_fields(self):
+        # Regression: bytes 8:12 hold baseFactor|filterPeriod, which are
+        # identical across major pools (10000|30 -> 1976080) and must
+        # never be reported as activeId.
+        data = bytearray(904)
+        data[8:12] = (1976080).to_bytes(4, "little")
+        data[76:80] = (21151).to_bytes(4, "little", signed=True)
+        self.assertEqual(_decode_active_bin_id(bytes(data)), 21151)
+
+    def test_meteora_active_bin_decode_negative_bins(self):
+        data = bytearray(904)
+        data[76:80] = (-21154).to_bytes(4, "little", signed=True)
+        self.assertEqual(_decode_active_bin_id(bytes(data)), -21154)
+
+    def test_meteora_active_bin_decode_short_buffer_returns_zero(self):
+        self.assertEqual(_decode_active_bin_id(b""), 0)
+        self.assertEqual(_decode_active_bin_id(bytes(range(79))), 0)
 
     def test_candidate_serialization_matches_dataclass_shape(self):
         candidate, _ = self.screener.screen_pool(self.sample_pool())

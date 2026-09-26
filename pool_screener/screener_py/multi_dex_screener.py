@@ -38,16 +38,32 @@ _ORCA_TIMEFRAMES = {"day": "24h", "week": "7d", "month": "30d"}
 _WINDOW_DAYS = {"day": 1.0, "week": 7.0, "month": 30.0}
 
 
-def _decode_active_bin_id(account_data: bytes) -> int:
-    """Extract activeId from Meteora DLMM LbPair account data.
+# LbPair byte layout (anchor discriminator + bytemuck struct fields):
+#   8..40   parameters   StaticParameters   (32 bytes)
+#   40..72  vParameters  VariableParameters (32 bytes)
+#   72..73  bumpSeed     [u8; 1]
+#   73..75  binStepSeed  [u8; 2]
+#   75..76  pairType     u8
+#   76..80  activeId     i32 (signed; bins are negative below the mid price)
+#   80..82  binStep      u16
+# Verified against the anchor IDL (@meteora-ag/dlmm) and live accounts: the
+# binStep u16 read at offset 80 matches the API bin_step for every pool.
+_ACTIVE_ID_OFFSET = 76
 
-    The LbPair account layout has activeId as the first u32 field after the
-    8-byte discriminator, at offset 8.
+
+def _decode_active_bin_id(account_data: bytes) -> int:
+    """Extract activeId (i32, little-endian) from a Meteora DLMM LbPair account.
+
+    activeId is NOT the first field after the 8-byte discriminator; it sits
+    at offset 76, after the 32-byte StaticParameters, 32-byte
+    VariableParameters, bumpSeed, binStepSeed, and pairType fields.
     """
-    if len(account_data) < 12:
+    end = _ACTIVE_ID_OFFSET + 4
+    if len(account_data) < end:
         return 0
-    active_id = int.from_bytes(account_data[8:12], "little")
-    return active_id
+    return int.from_bytes(
+        account_data[_ACTIVE_ID_OFFSET:end], "little", signed=True
+    )
 
 
 def _fetch_active_bin_id(rpc: Any, pool_address: str) -> int:
@@ -246,7 +262,9 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day", price_map: Dict[st
         normalized["token_x"] = token_x
         normalized["token_y"] = token_y
         normalized.update(top_level_token_metadata(token_x, token_y))
-        normalized["active_bin_id"] = integer(pool.get("activeId") or 0, "activeId")
+        normalized["active_bin_id"] = integer(
+            pool.get("activeId") or pool.get("active_bin_id") or 0, "activeId"
+        )
         normalized["current_tick_index"] = normalized["active_bin_id"]
         return normalized
 
