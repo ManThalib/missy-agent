@@ -3,6 +3,7 @@
 import base64
 import os
 import struct
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -20,6 +21,7 @@ from core.wallet_balances import (
 from .helius_history_client import HeliusHistoryClient
 from .helius_parser import HeliusWebhookParser
 from .helius_types import NormalizedTransaction, ParsedInstruction
+from .analytics.closure_state import ClosureState
 from .enrichment import enrich_positions
 from .liquidity_position import LiquidityPosition
 from .position_scan import PositionScan
@@ -86,7 +88,11 @@ class PositionScanner:
         self.webhook_parser = HeliusWebhookParser()
 
     def scan(
-        self, wallet: str, dex: str = "all", history_pages: int = 0
+        self,
+        wallet: str,
+        dex: str = "all",
+        history_pages: int = 0,
+        closure_state_path: Optional[str] = None,
     ) -> PositionScan:
         try:
             if len(_b58decode(wallet)) != 32:
@@ -171,6 +177,14 @@ class PositionScanner:
             )
 
         merged = self._merge_positions(current, historical)
+
+        # Filter historical closed positions: keep only active/inactive
+        # positions and closed positions that closed since the previous scan.
+        merged = self._filter_closed_positions(
+            merged,
+            closure_state_path=closure_state_path or "position_closure_state.json",
+        )
+
         enrich_positions(merged, errors)
         merged.sort(
             key=lambda item: (
@@ -501,6 +515,36 @@ class PositionScanner:
                 if name == wanted or name.endswith(wanted):
                     return pubkey
         return ""
+
+    @staticmethod
+    def _filter_closed_positions(
+        positions: List[LiquidityPosition],
+        closure_state_path: str,
+    ) -> List[LiquidityPosition]:
+        """Exclude closed positions already emitted in a previous scan.
+
+        On the very first scan (no state file exists), all closed positions
+        are recorded as "already reported" and are omitted from output, but
+        they are persisted so future scans know they are old.
+        """
+        state_path = closure_state_path
+        state_existed = os.path.exists(state_path)
+        closure_state = ClosureState(path=state_path)
+
+        newly_closed_tuples = closure_state.refresh(positions)
+        newly_closed_keys = {key for _, key in newly_closed_tuples}
+
+        if not state_existed:
+            # First run: treat every closed position as already reported.
+            newly_closed_keys = set()
+
+        def _is_kept(position: LiquidityPosition) -> bool:
+            if position.status != "closed":
+                return True
+            key = f"{position.dex}:{position.position_address}"
+            return key in newly_closed_keys
+
+        return [position for position in positions if _is_kept(position)]
 
     @staticmethod
     def _merge_positions(

@@ -53,6 +53,12 @@ def parse_args(argv=None):
         help="Watch mode: poll interval in seconds",
     )
     parser.add_argument(
+        "--closure-state-path",
+        type=str,
+        default="position_closure_state.json",
+        help="Path to the persistent closed-position state file",
+    )
+    parser.add_argument(
         "--json", action="store_true", help="Output raw JSON instead of table"
     )
 
@@ -75,6 +81,7 @@ def main() -> int:
                 args.wallet,
                 dex=args.dex,
                 history_pages=args.position_history_pages,
+                closure_state_path=args.closure_state_path,
             )
         except Exception as exc:
             # Full stack goes to stderr (cron.log) so failures carry context.
@@ -87,7 +94,10 @@ def main() -> int:
 
         newly_closed = set()
         try:
-            _, newly_closed_keys = scan_closure_state(position_scan.positions)
+            _, newly_closed_keys = scan_closure_state(
+                position_scan.positions,
+                state_path=args.closure_state_path,
+            )
             newly_closed = set(newly_closed_keys)
             if newly_closed_keys:
                 print(

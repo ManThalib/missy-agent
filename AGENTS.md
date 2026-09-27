@@ -1,5 +1,14 @@
 # Multi-DEX Pool Screener
 
+## Communication Protocol
+
+- Mr. Man does not message Missy directly, and Missy never alerts Mr. Man
+  directly. All traffic to or from Mr. Man is bridged by **Miraa** (Executive
+  Communicator).
+- Clarifications, errors, and scheduled reminders go to Miraa in the backend;
+  Miraa consolidates and briefs Mr. Man in a single, organized message when
+  multiple agents have updates.
+
 ## Scope
 
 - `pool_screener/pool_screener.py`, `position_screener/position_screener.py`, and `wallet_scanner/main.py` are the CLI entrypoints. Shared logic lives in the top-level `core/` package; `screener_py/` and `screener_position_py/` own provider-specific logic, and `wallet_scanner/` keeps one class per file.

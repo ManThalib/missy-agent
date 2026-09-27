@@ -294,7 +294,12 @@ class MultiDexScreener:
         """Collect token mints from raw pools and fetch Jupiter USD prices."""
         mints: set = set()
         for pool in pools:
-            n = normalize_pool(pool, window=self.config.window)
+            try:
+                n = normalize_pool(pool, window=self.config.window)
+            except (TypeError, ValueError, OverflowError):
+                # Malformed payload: skip price collection here; screen_all
+                # still rejects the pool with a reason (AGENTS.md policy).
+                continue
             for key in ("token_x", "token_y"):
                 token = n.get(key) or {}
                 address = token.get("address")
@@ -318,10 +323,14 @@ class MultiDexScreener:
             if isinstance(token_obj, dict):
                 token_obj["price_usd"] = price
 
-        for key in ("token_x", "token_y"):
-            address = None
-            # Try normalized shape first
+        try:
             n = normalize_pool(pool, window=self.config.window)
+        except (TypeError, ValueError, OverflowError):
+            # Malformed payload: no addresses to annotate; screen_pool/screen_all
+            # reports the reject reason (AGENTS.md policy).
+            return
+
+        for key in ("token_x", "token_y"):
             token = n.get(key) or {}
             address = token.get("address")
             if not address or address not in price_map:
