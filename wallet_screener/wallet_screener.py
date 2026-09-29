@@ -1,4 +1,4 @@
-"""Wallet scanner orchestrator."""
+"""Wallet screener orchestrator."""
 
 from __future__ import annotations
 

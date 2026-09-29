@@ -50,6 +50,28 @@ _WINDOW_DAYS = {"day": 1.0, "week": 7.0, "month": 30.0}
 # binStep u16 read at offset 80 matches the API bin_step for every pool.
 _ACTIVE_ID_OFFSET = 76
 
+# Orca Whirlpool account: anchor discriminator(8) | whirlpoolsConfig(32)
+# | whirlpoolBump(1) | tickSpacing(u16) | tickSpacingSeed(2) | feeRate(u16)
+# | protocolFeeRate(u16) | liquidity(u128) | sqrtPrice(u128)
+# | tickCurrentIndex i32 @81. Verified against live mainnet accounts:
+# ZEC/USDC GTHK... decoded 26726 where the SDK reported ~26191 hours earlier.
+_ORCA_TICK_OFFSET = 81
+
+# Raydium CLMM PoolState (zero-copy POD, 16-byte aligned):
+# discriminator(8) | ammConfig(32) | poolCreator(32) | tokenMint0(32)
+# | tokenMint1(32) | lpMint(32) | tokenVault0(32) | tokenVault1(32)
+# | observationKey(32) | mintDecimals0(1) | mintDecimals1(1) | tickSpacing(u16)
+# | pad(4) | liquidity(u128)@272 | sqrtPriceX64(u128)@288 | tickCurrent i32 @304.
+# Not yet verified against a live account (no Raydium pools in current scans);
+# consumers must treat raydium ticks as best-effort.
+_RAYDIUM_TICK_OFFSET = 304
+
+
+def _decode_i32_at(account_data: bytes, offset: int) -> int:
+    if len(account_data) < offset + 4:
+        return 0
+    return int.from_bytes(account_data[offset : offset + 4], "little", signed=True)
+
 
 def _decode_active_bin_id(account_data: bytes) -> int:
     """Extract activeId (i32, little-endian) from a Meteora DLMM LbPair account.
@@ -81,6 +103,33 @@ def _fetch_active_bin_id(rpc: Any, pool_address: str) -> int:
             return _decode_active_bin_id(base64.b64decode(data))
         if isinstance(data, bytes):
             return _decode_active_bin_id(data)
+        return 0
+    except Exception:
+        return 0
+
+
+def _fetch_current_tick(rpc: Any, dex: str, pool_address: str) -> int:
+    """Fetch the live current tick via RPC for Orca whirlpools and Raydium CLMM.
+
+    The discovery APIs do not expose tickCurrentIndex/tickCurrent, so the
+    pool account is read directly. Returns 0 when unavailable; callers must
+    treat 0 as unknown, not as a real tick.
+    """
+    offset = {"orca": _ORCA_TICK_OFFSET, "raydium": _RAYDIUM_TICK_OFFSET}.get(
+        (dex or "").lower()
+    )
+    if rpc is None or offset is None:
+        return 0
+    try:
+        result = rpc.get_account_info(pool_address)
+        value = result.get("value") if isinstance(result, dict) else None
+        data = value.get("data") if isinstance(value, dict) else None
+        if isinstance(data, list) and data:
+            data = data[0]
+        if isinstance(data, str):
+            return _decode_i32_at(base64.b64decode(data), offset)
+        if isinstance(data, bytes):
+            return _decode_i32_at(data, offset)
         return 0
     except Exception:
         return 0
@@ -428,10 +477,22 @@ class MultiDexScreener:
                 f"volatility {volatility:.1f}% > max {cfg.max_volatility:.1f}% (IL risk)",
             )
 
-        # 5. Fetch active bin ID via RPC for Meteora DLMM pools
+        # 5. Fetch live price index via RPC. Meteora DLMM exposes activeId;
+        # Orca/Raydium discovery APIs omit the current tick, so their pool
+        # accounts are decoded directly. Without this, open ranges would be
+        # centered at tick 0 (the ZEC/USDC re-open bug).
         active_bin_id = 0
-        if self.rpc and n.get("dex") == "meteora" and pool_type == "DLMM":
+        current_tick_index = 0
+        dex_name = str(n.get("dex") or "")
+        if self.rpc and dex_name == "meteora" and pool_type == "DLMM":
             active_bin_id = _fetch_active_bin_id(self.rpc, n.get("pool_address", ""))
+            current_tick_index = active_bin_id
+        elif self.rpc and dex_name in ("orca", "raydium"):
+            current_tick_index = int(n.get("current_tick_index") or 0)
+            if current_tick_index == 0:
+                current_tick_index = _fetch_current_tick(
+                    self.rpc, dex_name, n.get("pool_address", "")
+                )
 
         # 6. Protocol-neutral score, normalized to daily observations.
         breakdown = self.scorer.score(
@@ -477,6 +538,7 @@ class MultiDexScreener:
             fee_rate=float(n.get("fee_rate") or 0.0),
             tick_spacing=tick_spacing,
             active_bin_id=int(active_bin_id),
+            current_tick_index=int(current_tick_index),
             effective_tvl=breakdown.effective_tvl,
             realized_fee_apr=breakdown.realized_fee_apr,
             adjusted_apr=breakdown.adjusted_apr,

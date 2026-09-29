@@ -11,7 +11,7 @@
 
 ## Scope
 
-- `pool_screener/pool_screener.py`, `position_screener/position_screener.py`, and `wallet_scanner/main.py` are the CLI entrypoints. Shared logic lives in the top-level `core/` package; `screener_py/` and `screener_position_py/` own provider-specific logic, and `wallet_scanner/` keeps one class per file.
+- `pool_screener/pool_screener.py`, `position_screener/position_screener.py`, and `wallet_screener/main.py` are the CLI entrypoints. Shared logic lives in the top-level `core/` package; `screener_py/` and `screener_position_py/` own provider-specific logic, and `wallet_screener/` keeps one class per file.
 - The default `--dex all` queries Meteora DLMM, Raydium Standard/CLMM, and Orca Whirlpools. Keep provider payload conversion in `normalize_pool()` so filtering remains provider-independent.
 - This project uses only the Python standard library. Do not introduce a dependency or requirements file for ordinary HTTP/CLI work.
 
@@ -23,11 +23,11 @@
   ```bash
   cd pool_screener      && python3 test_screener.py
   cd position_screener && python3 test_positions.py
-  cd wallet_scanner    && python3 test_wallet_scanner.py
+  cd wallet_screener    && python3 test_wallet_screener.py
   python3 -m unittest core.test_core
   ```
 - Run one test: `python3 -m unittest test_screener.TestScreener.test_orca_pool_normalization`.
-- Verify argument wiring after CLI edits: `python3 pool_screener.py --help` or `python3 -m wallet_scanner.main --help`.
+- Verify argument wiring after CLI edits: `python3 pool_screener.py --help` or `python3 -m wallet_screener.main --help`.
 
 ## Provider Details
 

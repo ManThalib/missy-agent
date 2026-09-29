@@ -116,43 +116,43 @@ class PositionScanner:
         current: List[LiquidityPosition] = []
         successful_providers = 0
 
-        jobs = {}
-        with ThreadPoolExecutor(max_workers=len(selected)) as executor:
-            if "meteora" in selected:
-                jobs["meteora"] = executor.submit(self._fetch_meteora, wallet)
-            nft_mints: Optional[List[str]] = None
-            if "raydium" in selected or "orca" in selected:
-                try:
-                    nft_mints = self._fetch_nft_mints(wallet)
-                except Exception as exc:
-                    errors["nft_inventory"] = str(exc)
-                    nft_mints = None
-            if "raydium" in selected and nft_mints is not None:
-                jobs["raydium"] = executor.submit(
-                    self._fetch_nft_positions, "raydium", nft_mints
-                )
-            elif "raydium" in selected:
-                errors["raydium"] = "NFT inventory lookup failed"
-            if "orca" in selected and nft_mints is not None:
-                jobs["orca"] = executor.submit(
-                    self._fetch_nft_positions, "orca", nft_mints
-                )
-            elif "orca" in selected:
-                errors["orca"] = "NFT inventory lookup failed"
-            for name in selected:
-                if name not in jobs:
-                    continue
-                try:
-                    current.extend(jobs[name].result())
-                    successful_providers += 1
-                except Exception as exc:
-                    errors[name] = str(exc)
+        current, errors, successful_providers = self._fetch_current(wallet, selected)
 
         if successful_providers == 0:
             failures = "; ".join(
                 f"{name}: {errors.get(name, 'not attempted')}" for name in selected
             )
             raise RuntimeError(f"All selected position providers failed: {failures}")
+
+        if not current or errors:
+            # Freshly opened positions race RPC indexing (a just-minted
+            # position NFT can be invisible to a confirmed
+            # getTokenAccountsByOwner for several seconds). An empty or
+            # partial wallet here makes downstream dedup think nothing is
+            # held and re-open the same pool. Retry once before reporting.
+            time.sleep(3.0)
+            retry_current, retry_errors, retry_providers = self._fetch_current(
+                wallet, selected
+            )
+            if retry_current or not retry_errors:
+                current = retry_current
+                errors = retry_errors
+                successful_providers = retry_providers
+
+        if not current or errors:
+            # Freshly opened positions race RPC indexing (a just-minted
+            # position NFT can be invisible to a finalized/confirmed
+            # getTokenAccountsByOwner for several seconds). An empty or
+            # partial wallet here makes downstream dedup think nothing is
+            # held and re-open the same pool. Retry once before reporting.
+            time.sleep(3.0)
+            retry_current, retry_errors, retry_providers = self._fetch_current(
+                wallet, selected
+            )
+            if retry_current or not retry_errors:
+                current = retry_current
+                errors = retry_errors
+                successful_providers = retry_providers
 
         historical: List[LiquidityPosition] = []
         history_complete = False
@@ -237,6 +237,49 @@ class PositionScanner:
             history_complete=history_complete,
         )
 
+    def _fetch_current(
+        self, wallet: str, selected: Sequence[str]
+    ) -> Tuple[List[LiquidityPosition], Dict[str, str], int]:
+        """Fetch live positions from the selected DEX providers.
+
+        Returns (positions, errors, successful_provider_count).
+        """
+        errors: Dict[str, str] = {}
+        current: List[LiquidityPosition] = []
+        successful_providers = 0
+        jobs = {}
+        with ThreadPoolExecutor(max_workers=len(selected)) as executor:
+            if "meteora" in selected:
+                jobs["meteora"] = executor.submit(self._fetch_meteora, wallet)
+            nft_mints: Optional[List[str]] = None
+            if "raydium" in selected or "orca" in selected:
+                try:
+                    nft_mints = self._fetch_nft_mints(wallet)
+                except Exception as exc:
+                    errors["nft_inventory"] = str(exc)
+                    nft_mints = None
+            if "raydium" in selected and nft_mints is not None:
+                jobs["raydium"] = executor.submit(
+                    self._fetch_nft_positions, "raydium", nft_mints
+                )
+            elif "raydium" in selected:
+                errors["raydium"] = "NFT inventory lookup failed"
+            if "orca" in selected and nft_mints is not None:
+                jobs["orca"] = executor.submit(
+                    self._fetch_nft_positions, "orca", nft_mints
+                )
+            elif "orca" in selected:
+                errors["orca"] = "NFT inventory lookup failed"
+            for name in selected:
+                if name not in jobs:
+                    continue
+                try:
+                    current.extend(jobs[name].result())
+                    successful_providers += 1
+                except Exception as exc:
+                    errors[name] = str(exc)
+        return current, errors, successful_providers
+
     def _program_accounts(
         self, program: str, filters: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -246,7 +289,7 @@ class PositionScanner:
                 program,
                 {
                     "encoding": "base64",
-                    "commitment": "finalized",
+                    "commitment": "confirmed",
                     "filters": filters,
                 },
             ],
@@ -320,7 +363,7 @@ class PositionScanner:
                     {"programId": program},
                     {
                         "encoding": "jsonParsed",
-                        "commitment": "finalized",
+                        "commitment": "confirmed",
                     },
                 ],
             )
@@ -371,7 +414,7 @@ class PositionScanner:
                         program,
                         {
                             "encoding": "base64",
-                            "commitment": "finalized",
+                            "commitment": "confirmed",
                             "filters": filters,
                         },
                     ],

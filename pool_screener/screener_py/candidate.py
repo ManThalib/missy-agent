@@ -48,6 +48,7 @@ class Candidate:
     token_y_decimals: int = 0  # Base-10 decimals of token_y
     token_y_price_usd: float = 0.0  # Token Y price in USD
     active_bin_id: int = 0  # Active bin ID from DLMM LbPair account
+    current_tick_index: int = 0  # Live current tick/bin (orca whirlpool / raydium CLMM; = active_bin_id for meteora)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the candidate to a JSON-compatible dictionary."""
@@ -89,4 +90,5 @@ class Candidate:
             "token_y_decimals": self.token_y_decimals,
             "token_y_price_usd": self.token_y_price_usd,
             "active_bin_id": self.active_bin_id,
+            "current_tick_index": self.current_tick_index,
         }

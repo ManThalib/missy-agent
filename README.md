@@ -4,7 +4,7 @@ A standard-library Python suite for screening liquidity pools and monitoring wal
 
 1. **Pool Screener**: Discovers and filters pools using provider APIs.
 2. **Position Screener**: Analyzes active and historical LP positions for a given wallet using RPC.
-3. **Wallet Scanner**: Fetches SOL, SPL, and Token-2022 balances, prices them in USD via Jupiter, and filters assets below a configurable USD threshold.
+3. **Wallet Screener**: Fetches SOL, SPL, and Token-2022 balances, prices them in USD via Jupiter, and filters assets below a configurable USD threshold.
 
 The applications do not build, sign, or submit transactions. Pool discovery uses indexed public APIs and is appropriate for screening, not settlement.
 
@@ -30,7 +30,7 @@ The applications do not build, sign, or submit transactions. Pool discovery uses
 
 ## Setup
 
-No installation or virtual environment is required. The project is split into three independent tools: `pool_screener`, `position_screener`, and `wallet_scanner`.
+No installation or virtual environment is required. The project is split into three independent tools: `pool_screener`, `position_screener`, and `wallet_screener`.
 
 ### Pool Screener
 
@@ -123,14 +123,14 @@ python3 position_screener.py --wallet YOUR_SOLANA_WALLET --json
 python3 position_screener.py --wallet YOUR_SOLANA_WALLET --position-history-pages 5
 ```
 
-## Wallet Scanner
+## Wallet Screener
 
 ```bash
-cd wallet_scanner
-python3 -m wallet_scanner.main --help
-python3 -m wallet_scanner.main --wallet YOUR_SOLANA_WALLET
-python3 -m wallet_scanner.main --wallet YOUR_SOLANA_WALLET --json
-python3 -m wallet_scanner.main --wallet YOUR_SOLANA_WALLET --include-dust
+cd wallet_screener
+python3 -m wallet_screener.main --help
+python3 -m wallet_screener.main --wallet YOUR_SOLANA_WALLET
+python3 -m wallet_screener.main --wallet YOUR_SOLANA_WALLET --json
+python3 -m wallet_screener.main --wallet YOUR_SOLANA_WALLET --include-dust
 ```
 
 The scanner fetches SOL and all SPL/Token-2022 balances, prices them in USD via
@@ -178,7 +178,7 @@ scan = PositionScanner().scan(
 ```
 
 ```python
-from wallet_scanner import WalletScanner
+from wallet_screener import WalletScanner
 
 result = WalletScanner().scan("YOUR_SOLANA_WALLET")
 print(result["total_usd"], result["asset_count"])
@@ -197,8 +197,8 @@ python3 pool_screener.py --help
 cd ../position_screener
 python3 -m unittest test_positions
 python3 position_screener.py --help
-cd ../wallet_scanner
-python3 -m unittest test_wallet_scanner
-python3 -m wallet_scanner.main --help
+cd ../wallet_screener
+python3 -m unittest test_wallet_screener
+python3 -m wallet_screener.main --help
 python3 -m unittest core.test_core
 ```

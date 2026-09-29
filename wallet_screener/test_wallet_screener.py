@@ -15,10 +15,10 @@ if __package__ in (None, ""):
 from core.prices import JupiterPriceClient
 
 VALID_WALLET = "So11111111111111111111111111111111111111112"
-from wallet_scanner.balance_calculator import BalanceCalculator
-from wallet_scanner.models import TokenBalance
-from wallet_scanner.price_fetcher import TokenPriceFetcher
-from wallet_scanner.wallet_scanner import WalletScanner
+from wallet_screener.balance_calculator import BalanceCalculator
+from wallet_screener.models import TokenBalance
+from wallet_screener.price_fetcher import TokenPriceFetcher
+from wallet_screener.wallet_screener import WalletScanner
 
 
 class TestBalanceCalculator(unittest.TestCase):

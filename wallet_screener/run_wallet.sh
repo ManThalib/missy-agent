@@ -10,9 +10,9 @@
 # Example:
 #   SOLANA_RPC_URL='https://...' WALLET_PUBLIC_KEY='...' ./run_wallet.sh
 set -u
-REPO=/data/missy-agent/wallet_scanner
-OUTDIR=/data/missy-data/wallet_scans
-LOG=/data/missy-data/wallet_scans/cron.log
+REPO=/data/missy-agent/wallet_screener
+OUTDIR=/data/missy-data/wallet_screens
+LOG=/data/missy-data/wallet_screens/cron.log
 BALANCE_CACHE=/data/missy-data/wallet_balances.json
 # Use Asia/Shanghai (UTC+8) for all timestamps and filenames.
 export TZ=Asia/Shanghai
@@ -28,10 +28,10 @@ fi
 
 mkdir -p "$OUTDIR"
 TS=$(date +%Y%m%d-%H%M%S)
-OUT="$OUTDIR/wallet_scan-$TS.json"
-LATEST="$OUTDIR/wallet_scan-latest.json"
+OUT="$OUTDIR/wallet_screen-$TS.json"
+LATEST="$OUTDIR/wallet_screen-latest.json"
 cd "$REPO" || exit 1
-python3 main.py --json > "$OUT" 2>> "$LOG"
+python3 main.py --json --output-dir "$OUTDIR" > "$OUT" 2>> "$LOG"
 STATUS=$?
 if [ $STATUS -ne 0 ]; then
   echo "[$(date +%FT%T%z)] FAILED exit=$STATUS out=$OUT" >> "$LOG"

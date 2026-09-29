@@ -1,6 +1,6 @@
 #!/bin/bash
 # Missy position screener cronjob wrapper.
-# Scans active LP positions from the executor wallet via Solana RPC,
+# Scans active Meteora LP positions from the executor wallet via Solana RPC,
 # writes timestamped JSON output.
 set -u
 REPO=/data/missy-agent/position_screener
@@ -25,7 +25,7 @@ OUT="$OUTDIR/position_scan-$TS.json"
 cd "$REPO" || exit 1
 # Buffer stderr so failure context can be embedded in the .failed record.
 ERRTMP=$(mktemp)
-python3 position_screener.py --wallet "$WALLET" --json > "$OUT" 2> "$ERRTMP"
+python3 position_screener.py --wallet "$WALLET" --dex meteora --json > "$OUT" 2> "$ERRTMP"
 STATUS=$?
 cat "$ERRTMP" >> "$LOG"
 if [ $STATUS -ne 0 ]; then

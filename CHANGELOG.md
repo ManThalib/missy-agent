@@ -29,9 +29,9 @@ All notable changes to the Missy-agent Multi-DEX Screener Suite are documented h
 - **Core tests** (`core/test_core.py`) covering base58 round-trips, address
   validation, normalization, display, and Jupiter price parsing.
 
-#### Wallet Scanner
+#### Wallet Screener
 
-- **New `wallet_scanner/` module** built on `core/` with one class per file:
+- **New `wallet_screener/` module** built on `core/` with one class per file:
   - `config.py` — `USD_THRESHOLD` (default `$0.10`), endpoints, program IDs,
     and `resolve_rpc_url()` / `resolve_wallet()` helpers.
   - `models.py` — `TokenBalance` dataclass with `to_dict()` and a
@@ -41,11 +41,11 @@ All notable changes to the Missy-agent Multi-DEX Screener Suite are documented h
   - `price_fetcher.py` — `TokenPriceFetcher` batching Jupiter Price API v2 calls.
   - `balance_calculator.py` — `BalanceCalculator` for USD valuation and
     threshold filtering.
-  - `wallet_scanner.py` — `WalletScanner` orchestrator returning assets sorted
+  - `wallet_screener.py` — `WalletScanner` orchestrator returning assets sorted
     by descending USD value.
   - `main.py` — CLI with `--wallet`, `--threshold`, `--json`, `--watch`,
     `--include-dust`, and `--rpc-url`/`--price-url` overrides.
-- **Wallet scanner tests** (`wallet_scanner/test_wallet_scanner.py`).
+- **Wallet screener tests** (`wallet_screener/test_wallet_screener.py`).
 
 ### Changed
 

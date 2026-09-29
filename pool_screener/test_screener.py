@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for the multi-DEX pool screener."""
 
+import base64
 import unittest
 from argparse import Namespace
 from dataclasses import asdict, replace
@@ -8,7 +9,7 @@ from tempfile import NamedTemporaryFile
 from unittest.mock import Mock
 
 from screener_py.client import MultiDexClient
-from screener_py.multi_dex_screener import _decode_active_bin_id
+from screener_py.multi_dex_screener import _decode_active_bin_id, _decode_i32_at
 from screener_py.scoring import PoolScoreInput, PoolScorer
 from screener_py.screener import (
     FilterConfig,
@@ -258,6 +259,76 @@ class TestScreener(unittest.TestCase):
     def test_meteora_active_bin_decode_short_buffer_returns_zero(self):
         self.assertEqual(_decode_active_bin_id(b""), 0)
         self.assertEqual(_decode_active_bin_id(bytes(range(79))), 0)
+
+    # ------------------------------------------------------------------
+    # Orca/Raydium live-tick enrichment (ZEC/USDC center=0 re-open bug)
+    # ------------------------------------------------------------------
+
+    def test_orca_tick_decode_reads_i32_at_offset_81(self):
+        # Whirlpool.tickCurrentIndex sits at offset 81, after liquidity and
+        # sqrtPrice (both u128). Verified against live mainnet accounts.
+        data = bytearray(653)
+        data[81:85] = (26726).to_bytes(4, "little", signed=True)
+        self.assertEqual(_decode_i32_at(bytes(data), 81), 26726)
+
+    def test_orca_tick_decode_negative_ticks(self):
+        data = bytearray(653)
+        data[81:85] = (-21266).to_bytes(4, "little", signed=True)
+        self.assertEqual(_decode_i32_at(bytes(data), 81), -21266)
+
+    def test_tick_decode_short_buffer_returns_zero(self):
+        self.assertEqual(_decode_i32_at(bytes(80), 81), 0)
+        self.assertEqual(_decode_i32_at(bytes(303), 304), 0)
+
+    @staticmethod
+    def _orca_raw_pool():
+        return {
+            "_dex": "orca",
+            "address": "OrcaPool111111111111111111111111111111111",
+            "tickSpacing": 64,
+            "feeRate": 3000,
+            "tvlUsdc": "50000",
+            "price": "1",
+            "priceHistory7d": ["0.98", "1.02"],
+            "tokenA": {
+                "symbol": "JUP",
+                "address": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+            },
+            "tokenB": {"symbol": "SOL", "address": SOL_MINT},
+            "stats": {
+                "24h": {"volume": "25000", "fees": "600", "yieldOverTvl": "0.012"}
+            },
+        }
+
+    def _rpc_returning_tick(self, offset: int, value: int):
+        account = bytearray(max(offset + 4, 653))
+        account[offset : offset + 4] = value.to_bytes(4, "little", signed=True)
+        rpc = Mock()
+        rpc.get_account_info = Mock(
+            return_value={
+                "value": {
+                    "data": [base64.b64encode(bytes(account)).decode(), "base64"]
+                }
+            }
+        )
+        return rpc
+
+    def test_orca_pool_enriches_current_tick_via_rpc(self):
+        self.screener.rpc = self._rpc_returning_tick(81, 26191)
+        candidate, _ = self.screener.screen_pool(self._orca_raw_pool())
+        self.assertEqual(candidate.current_tick_index, 26191)
+        # active_bin_id stays a Meteora-only concept.
+        self.assertEqual(candidate.active_bin_id, 0)
+        self.assertIn("current_tick_index", candidate.to_dict())
+
+    def test_raydium_pool_enriches_current_tick_via_rpc(self):
+        self.screener.rpc = self._rpc_returning_tick(304, -5299)
+        candidate, _ = self.screener.screen_pool(self.sample_pool())
+        self.assertEqual(candidate.current_tick_index, -5299)
+
+    def test_without_rpc_current_tick_stays_zero(self):
+        candidate, _ = self.screener.screen_pool(self._orca_raw_pool())
+        self.assertEqual(candidate.current_tick_index, 0)
 
     def test_candidate_serialization_matches_dataclass_shape(self):
         candidate, _ = self.screener.screen_pool(self.sample_pool())

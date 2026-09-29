@@ -1,4 +1,4 @@
-"""CLI entry point for the Solana wallet scanner."""
+"""CLI entry point for the Solana wallet screener."""
 
 from __future__ import annotations
 
@@ -7,19 +7,21 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List
 
 if __package__ in (None, ""):
     _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _REPO_ROOT not in sys.path:
         sys.path.insert(0, _REPO_ROOT)
-    from wallet_scanner.config import (
+    from wallet_screener.config import (
         JUPITER_PRICE_URL,
         USD_THRESHOLD,
         WALLET_ENV,
         resolve_wallet,
     )
-    from wallet_scanner.wallet_scanner import WalletScanner
+    from wallet_screener.wallet_screener import WalletScanner
 else:
     from .config import (
         JUPITER_PRICE_URL,
@@ -27,7 +29,7 @@ else:
         WALLET_ENV,
         resolve_wallet,
     )
-    from .wallet_scanner import WalletScanner
+    from .wallet_screener import WalletScanner
 
 SEPARATOR = "-" * 118
 
@@ -84,6 +86,17 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Show assets at or below the threshold (disables filtering)",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="/data/missy-data/wallet_screens",
+        help="Directory where the JSON screen file is written",
+    )
+    parser.add_argument(
+        "--no-output-file",
+        action="store_true",
+        help="Skip writing the screen JSON file to disk",
+    )
     args = parser.parse_args(argv)
     if args.json and args.watch:
         parser.error("--json cannot be combined with --watch")
@@ -125,6 +138,17 @@ def print_scan(result: Dict[str, Any]) -> None:
     print(SEPARATOR)
 
 
+def _write_output_file(args: argparse.Namespace, result: Dict[str, Any]) -> str | None:
+    if args.no_output_file or not args.output_dir:
+        return None
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = output_dir / f"wallet_screen-{timestamp}.json"
+    path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    return str(path)
+
+
 def run_cycle(args: argparse.Namespace, scanner: WalletScanner) -> bool:
     wallet = resolve_wallet(args.wallet)
     if not wallet:
@@ -144,8 +168,14 @@ def run_cycle(args: argparse.Namespace, scanner: WalletScanner) -> bool:
     if args.json:
         json.dump(result, sys.stdout, indent=2)
         print()
+        output_path = _write_output_file(args, result)
+        if output_path:
+            print(f"Screen written to: {output_path}", file=sys.stderr)
         return True
     print_scan(result)
+    output_path = _write_output_file(args, result)
+    if output_path:
+        print(f"Screen written to: {output_path}", file=sys.stderr)
     return True
 
 

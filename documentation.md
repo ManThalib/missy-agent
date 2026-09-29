@@ -7,7 +7,7 @@ The project has three cooperating packages plus a shared core:
 - `screener_py` discovers, normalizes, filters, scores, and displays pools.
 - `screener_position_py` discovers wallet LP positions, normalizes Helius
   transactions, tracks closures, and exposes conservative position analytics.
-- `wallet_scanner` fetches SOL/SPL/Token-2022 balances, prices them via Jupiter
+- `wallet_screener` fetches SOL/SPL/Token-2022 balances, prices them via Jupiter
   Price API v2, filters dust, and reports a sorted USD portfolio.
 - `core` provides the shared HTTP, RPC, Helius, base58/Solana, normalization,
   display, price, and wallet-balance helpers reused by all three tools.
@@ -94,15 +94,15 @@ Missy-agent/
 |           |-- scoring.py
 |           |-- trader_scoring.py
 |           `-- closure_state.py
-`-- wallet_scanner/
-    |-- main.py                         # Wallet scanner CLI entrypoint
-    |-- test_wallet_scanner.py
+`-- wallet_screener/
+    |-- main.py                         # Wallet screener CLI entrypoint
+    |-- test_wallet_screener.py
     |-- config.py
     |-- models.py
     |-- rpc_client.py                   # SolanaRpcClient with retry/backoff
     |-- price_fetcher.py              # TokenPriceFetcher (Jupiter v2)
     |-- balance_calculator.py         # USD valuation and threshold filter
-    `-- wallet_scanner.py             # Orchestrator
+    `-- wallet_screener.py             # Orchestrator
 ```
 
 Compatibility modules contain imports only. Canonical implementations live in
@@ -252,12 +252,12 @@ returns `(accepted, target_token, paired_token, reason)`. An empty target set
 matches nothing. Empty or invalid paired configuration uses `SOL`, `USDC`, and
 `USDT` defaults.
 
-## Wallet Scanner APIs
+## Wallet Screener APIs
 
 ### `WalletScanner`
 
 ```python
-from wallet_scanner import WalletScanner
+from wallet_screener import WalletScanner
 
 result = WalletScanner().scan("YOUR_SOLANA_WALLET")
 ```
@@ -459,7 +459,7 @@ distinct path.
 | `METEORA_API_BASE` | Override Meteora API base. |
 | `SOLANA_RPC_URL` | Current-position Solana RPC endpoint. |
 | `HELIUS_API_KEY` | Enable Helius RPC fallback and lifecycle history. |
-| `WALLET_PUBLIC_KEY` | Default wallet for `wallet_scanner/main.py`. |
+| `WALLET_PUBLIC_KEY` | Default wallet for `wallet_screener/main.py`. |
 | `JUPITER_PRICE_V2_URL` | Override Jupiter Price API v2 endpoint. |
 
 The project does not load `.env` itself. Set variables before the Python process
@@ -478,9 +478,9 @@ cd ../position_screener
 python3 -m unittest test_positions
 python3 position_screener.py --help
 
-cd ../wallet_scanner
-python3 -m unittest test_wallet_scanner
-python3 -m wallet_scanner.main --help
+cd ../wallet_screener
+python3 -m unittest test_wallet_screener
+python3 -m wallet_screener.main --help
 
 cd ..
 python3 -m unittest core.test_core
