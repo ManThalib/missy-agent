@@ -101,7 +101,7 @@ def _parse_token_account(account: Any) -> Optional[TokenBalance]:
     raw_amount = token_amount.get("amount", account.get("raw_amount", "0"))
     return TokenBalance(
         mint=mint,
-        symbol="wSOL" if mint == WRAPPED_SOL_MINT else account.get("symbol", ""),
+        symbol=account.get("symbol") or KNOWN_MINT_SYMBOLS.get(mint, ""),
         decimals=decimals,
         amount_raw=str(raw_amount),
         amount_ui=ui_amount,
@@ -114,3 +114,13 @@ def _safe_parsed_info(account: dict) -> dict:
         return account["account"]["data"]["parsed"]["info"]
     except (KeyError, TypeError):
         return {}
+
+
+# The Solana jsonParsed token-account response carries no token symbol, so
+# resolve well-known mints locally. Unknown mints keep an empty symbol and are
+# skipped from the symbol-keyed balance cache (they remain in the raw JSON).
+KNOWN_MINT_SYMBOLS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
+    "So11111111111111111111111111111111111111112": "wSOL",
+}

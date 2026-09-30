@@ -1,6 +1,6 @@
 #!/bin/bash
 # Missy pool screener cronjob wrapper.
-# Runs the Meteora pool screener only, writes timestamped JSON output.
+# Runs the pool screener across all three DEXes (Meteora, Raydium, Orca), writes timestamped JSON output.
 set -u
 REPO=/data/missy-agent/pool_screener
 OUTDIR=/data/missy-data/pool_screens
@@ -18,7 +18,7 @@ mkdir -p "$OUTDIR"
 TS=$(date +%Y%m%d-%H%M%S)
 OUT="$OUTDIR/pool_scan-$TS.json"
 cd "$REPO" || exit 1
-python3 pool_screener.py --dex meteora --json --pages 1 > "$OUT" 2>> "$LOG"
+python3 pool_screener.py --dex all --json --pages 1 > "$OUT" 2>> "$LOG"
 STATUS=$?
 if [ $STATUS -ne 0 ]; then
   echo "[$(date +%FT%T%z)] FAILED exit=$STATUS out=$OUT" >> "$LOG"
