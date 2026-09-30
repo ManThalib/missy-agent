@@ -57,14 +57,16 @@ _ACTIVE_ID_OFFSET = 76
 # ZEC/USDC GTHK... decoded 26726 where the SDK reported ~26191 hours earlier.
 _ORCA_TICK_OFFSET = 81
 
-# Raydium CLMM PoolState (zero-copy POD, 16-byte aligned):
-# discriminator(8) | ammConfig(32) | poolCreator(32) | tokenMint0(32)
-# | tokenMint1(32) | lpMint(32) | tokenVault0(32) | tokenVault1(32)
-# | observationKey(32) | mintDecimals0(1) | mintDecimals1(1) | tickSpacing(u16)
-# | pad(4) | liquidity(u128)@272 | sqrtPriceX64(u128)@288 | tickCurrent i32 @304.
-# Not yet verified against a live account (no Raydium pools in current scans);
-# consumers must treat raydium ticks as best-effort.
-_RAYDIUM_TICK_OFFSET = 304
+# Raydium CLMM PoolState (zero-copy, repr(packed) — no alignment padding):
+# discriminator(8) | bump(1) | ammConfig(32) | owner(32) | tokenMint0(32)
+# | tokenMint1(32) | tokenVault0(32) | tokenVault1(32) | observationKey(32)
+# | mintDecimals0(1) | mintDecimals1(1) | tickSpacing u16 @235
+# | liquidity(u128)@237 | sqrtPriceX64(u128)@253 | tickCurrent i32 @269.
+# Verified live on 3 mainnet CLMM pools (2026-09-30): tickSpacing u16@235
+# matched (120/60/60), and tickCurrent@269 equals floor(log(sqrtPriceX64^2
+# / 2^128)/log(1.0001)) exactly on every account. The old @304 derivation
+# assumed 16-byte alignment + [u8;3] bump and always read 0.
+_RAYDIUM_TICK_OFFSET = 269
 
 
 def _decode_i32_at(account_data: bytes, offset: int) -> int:

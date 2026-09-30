@@ -282,7 +282,7 @@ class TestScreener(unittest.TestCase):
 
     def test_tick_decode_short_buffer_returns_zero(self):
         self.assertEqual(_decode_i32_at(bytes(80), 81), 0)
-        self.assertEqual(_decode_i32_at(bytes(303), 304), 0)
+        self.assertEqual(_decode_i32_at(bytes(268), 269), 0)
 
     @staticmethod
     def _orca_raw_pool():
@@ -326,7 +326,7 @@ class TestScreener(unittest.TestCase):
         self.assertIn("current_tick_index", candidate.to_dict())
 
     def test_raydium_pool_enriches_current_tick_via_rpc(self):
-        self.screener.rpc = self._rpc_returning_tick(304, -5299)
+        self.screener.rpc = self._rpc_returning_tick(269, -5299)
         candidate, _ = self.screener.screen_pool(self.sample_pool())
         self.assertEqual(candidate.current_tick_index, -5299)
 
