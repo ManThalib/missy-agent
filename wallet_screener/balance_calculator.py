@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from typing import List
 
-from .config import USD_THRESHOLD
 from .models import TokenBalance
 
 
 class BalanceCalculator:
     """Convert raw balances into USD-valued records and filter dust."""
 
-    def __init__(self, threshold_usd: float = USD_THRESHOLD) -> None:
+    def __init__(self, threshold_usd: float = 0.0) -> None:
         self.threshold_usd = threshold_usd
 
     def calculate(self, amount_ui: float, price_usd: float) -> float:

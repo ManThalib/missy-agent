@@ -401,83 +401,29 @@ class MultiDexScreener:
                     _apply(pool.get("tokenB"), price)
 
     def screen_pool(self, p: Dict[str, Any], price_map: Dict[str, float] = None) -> Tuple[Optional[Candidate], str]:
+        """Normalize and enrich a raw pool, then emit it as a fact.
+
+        Policy filtering (whitelist, TVL/volume bands, scoring, etc.) is now
+        owned by Sheldon. Missy only supplies clean, normalized observations.
+        """
         n = normalize_pool(p, window=self.config.window, price_map=price_map)
-        token_x = n.get("token_x") or {}
-        token_y = n.get("token_y") or {}
 
-        # 1. Whitelist check
-        is_valid_pair, target_token, paired_token, pair_reason = (
-            self.whitelist.validate_pair(token_x, token_y)
-        )
-        if not is_valid_pair:
-            return None, pair_reason
-
-        cfg = self.config
-
-        # 2. Liquidity & volume gates
         tvl = float(n.get("tvl") or 0.0)
-        if cfg.min_tvl > 0 and tvl < cfg.min_tvl:
-            return None, f"TVL ${tvl:.0f} < min ${cfg.min_tvl:.0f}"
-        if cfg.max_tvl > 0 and tvl > cfg.max_tvl:
-            return None, f"TVL ${tvl:.0f} > max ${cfg.max_tvl:.0f}"
-
-        window_days = _WINDOW_DAYS.get(cfg.window, 1.0)
+        volume_window = float(n.get("volume") or 0.0)
+        window_days = _WINDOW_DAYS.get(self.config.window, 1.0)
         gross_fee_window = float(n.get("fee") or 0.0)
         if gross_fee_window <= 0.0:
             gross_fee_window = tvl * (float(n.get("fee_tvl_ratio") or 0.0) / 100.0)
         lp_fee_share = max(0.0, min(1.0, float(n.get("lp_fee_share", 1.0))))
         daily_fee_usd = gross_fee_window * lp_fee_share / window_days
         fee_tvl_ratio = (daily_fee_usd / tvl * 100.0) if tvl > 0.0 else 0.0
-        if cfg.min_fee_tvl > 0 and fee_tvl_ratio < cfg.min_fee_tvl:
-            return None, f"fee/TVL {fee_tvl_ratio:.2f}% < min {cfg.min_fee_tvl:.2f}%"
-
-        if cfg.min_daily_fee > 0 and daily_fee_usd < cfg.min_daily_fee:
-            return (
-                None,
-                f"daily fees ${daily_fee_usd:.1f} < min ${cfg.min_daily_fee:.1f}",
-            )
-
-        volume_window = float(n.get("volume") or 0.0)
-        if cfg.min_volume_usd > 0 and volume_window < cfg.min_volume_usd:
-            return None, f"volume ${volume_window:.0f} < min ${cfg.min_volume_usd:.0f}"
-
-        # Wash-trading / JIT gate
-        turnover_ratio = volume_window / window_days / tvl if tvl > 0 else 0.0
-        if turnover_ratio > cfg.max_turnover_ratio:
-            return (
-                None,
-                f"turnover ratio {turnover_ratio:.1f}x > max "
-                f"{cfg.max_turnover_ratio}x (wash trading)",
-            )
-
-        apr = float(n.get("apr") or 0.0)
-
-        # 3. CLMM tick-spacing band (Standard pools report 0 and skip the gate)
         tick_spacing = int(n.get("tick_spacing") or n.get("bin_step") or 0)
         pool_type = str(n.get("pool_type") or "")
-        is_clmm = pool_type.lower().startswith("concentr") or tick_spacing > 0
-        if is_clmm:
-            if cfg.min_bin_step > 0 and tick_spacing < cfg.min_bin_step:
-                return None, f"tick spacing {tick_spacing} < min {cfg.min_bin_step}"
-            if cfg.max_bin_step > 0 and tick_spacing > cfg.max_bin_step:
-                return None, f"tick spacing {tick_spacing} > max {cfg.max_bin_step}"
-
-        # Fee-tier band
         fee_pct = float(n.get("fee_pct") or 0.0)
-        if cfg.min_fee_pct > 0 and fee_pct < cfg.min_fee_pct:
-            return None, f"fee {fee_pct:.2f}% < min {cfg.min_fee_pct:.2f}%"
-        if cfg.max_fee_pct > 0 and fee_pct > cfg.max_fee_pct:
-            return None, f"fee {fee_pct:.2f}% > max {cfg.max_fee_pct:.2f}%"
-
-        # 4. Volatility gate (price excursion % over the window)
         volatility = float(n.get("volatility") or 0.0)
-        if cfg.max_volatility > 0 and volatility > cfg.max_volatility:
-            return (
-                None,
-                f"volatility {volatility:.1f}% > max {cfg.max_volatility:.1f}% (IL risk)",
-            )
+        apr = float(n.get("apr") or 0.0)
 
-        # 5. Fetch live price index via RPC. Meteora DLMM exposes activeId;
+        # Fetch live price index via RPC. Meteora DLMM exposes activeId;
         # Orca/Raydium discovery APIs omit the current tick, so their pool
         # accounts are decoded directly. Without this, open ranges would be
         # centered at tick 0 (the ZEC/USDC re-open bug).
@@ -494,36 +440,12 @@ class MultiDexScreener:
                     self.rpc, dex_name, n.get("pool_address", "")
                 )
 
-        # 6. Protocol-neutral score, normalized to daily observations.
-        breakdown = self.scorer.score(
-            PoolScoreInput(
-                tvl_usd=tvl,
-                fee_usd=gross_fee_window,
-                volume_usd=volume_window,
-                window_days=window_days,
-                reported_apr_pct=apr,
-                volatility_pct=(
-                    volatility
-                    if n.get("volatility_available", "volatility" in n)
-                    else None
-                ),
-                fee_tier_pct=fee_pct,
-                lp_fee_share=lp_fee_share,
-                pool_type=pool_type,
-            )
-        )
-        if cfg.min_apr > 0 and breakdown.adjusted_apr < cfg.min_apr:
-            return (
-                None,
-                f"adjusted APR {breakdown.adjusted_apr:.1f}% < min {cfg.min_apr:.1f}%",
-            )
-
         candidate = Candidate(
             pool_address=n.get("pool_address", ""),
             name=n.get("name", ""),
-            whitelisted_token_symbol=normalize_symbol(target_token.get("symbol", "")),
-            whitelisted_token_address=target_token.get("address", ""),
-            paired_token_symbol=normalize_symbol(paired_token.get("symbol", "")),
+            whitelisted_token_symbol=normalize_symbol((n.get("token_x") or {}).get("symbol", "")),
+            whitelisted_token_address=(n.get("token_x") or {}).get("address", ""),
+            paired_token_symbol=normalize_symbol((n.get("token_y") or {}).get("symbol", "")),
             tvl=tvl,
             fee_tvl_ratio=fee_tvl_ratio,
             daily_fee_usd=daily_fee_usd,
@@ -531,7 +453,8 @@ class MultiDexScreener:
             bin_step=tick_spacing,
             fee_pct=fee_pct,
             volatility=volatility,
-            score=breakdown.total,
+            # Scoring is now Sheldon's job; Missy emits a neutral placeholder.
+            score=0.0,
             dex=str(n.get("dex") or "raydium"),
             pool_type=pool_type,
             apr=apr,
@@ -539,13 +462,13 @@ class MultiDexScreener:
             tick_spacing=tick_spacing,
             active_bin_id=int(active_bin_id),
             current_tick_index=int(current_tick_index),
-            effective_tvl=breakdown.effective_tvl,
-            realized_fee_apr=breakdown.realized_fee_apr,
-            adjusted_apr=breakdown.adjusted_apr,
-            yield_score=breakdown.yield_score,
-            depth_score=breakdown.depth_score,
-            efficiency_score=breakdown.efficiency_score,
-            risk_score=breakdown.risk_score,
+            effective_tvl=tvl,
+            realized_fee_apr=0.0,
+            adjusted_apr=0.0,
+            yield_score=0.0,
+            depth_score=0.0,
+            efficiency_score=0.0,
+            risk_score=0.0,
             lp_fee_share=lp_fee_share,
             pool_price=float(n.get("pool_price") or 0.0),
             token_x_address=n.get("token_x_address", ""),

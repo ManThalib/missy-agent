@@ -13,8 +13,8 @@ from core.constants import (  # noqa: F401  (re-exported for scanner consumers)
     WRAPPED_SOL_MINT,
 )
 
-# Assets whose total USD value is at or below this threshold are filtered out.
-USD_THRESHOLD = 0.10
+# Dust filtering is a policy decision owned by Sheldon. Missy emits all
+# assets; this module no longer defines a threshold.
 
 # Default Jupiter endpoint (re-exported for convenience/overrides).
 JUPITER_PRICE_URL = JUPITER_PRICE_V2_URL

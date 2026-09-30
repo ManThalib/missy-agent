@@ -68,23 +68,24 @@ class TestScreener(unittest.TestCase):
         self.assertEqual(cand.whitelisted_token_symbol, "JUP")
         self.assertEqual(cand.paired_token_symbol, "SOL")  # WSOL normalized
 
-    def test_paired_token_rejected_when_not_allowed(self):
+    def test_paired_token_policy_no_longer_applies_in_missy(self):
+        # Pair policy now lives in Sheldon; Missy emits the pool as a fact.
         pool = self.sample_pool()
         pool["mintB"] = {
             "symbol": "PEPE",
             "address": "PepeAddress111111111111111111111111111111111",
         }
         cand, reason = self.screener.screen_pool(pool)
-        self.assertIsNone(cand)
-        self.assertIn("not an allowed paired asset", reason)
+        self.assertIsNotNone(cand, f"Expected fact emission, got: {reason}")
 
     def test_inverted_pair_orientation(self):
+        # Missy no longer applies pair policy; token_x/y order is preserved.
         pool = self.sample_pool()
         pool["mintA"], pool["mintB"] = pool["mintB"], pool["mintA"]
         cand, reason = self.screener.screen_pool(pool)
         self.assertIsNotNone(cand, f"Expected pass, got: {reason}")
-        self.assertEqual(cand.whitelisted_token_symbol, "JUP")
-        self.assertEqual(cand.paired_token_symbol, "SOL")
+        self.assertEqual(cand.whitelisted_token_symbol, "SOL")
+        self.assertEqual(cand.paired_token_symbol, "JUP")
 
     def test_from_file_json(self):
         wl = Whitelist.from_file("tokens.json")
@@ -121,21 +122,23 @@ class TestScreener(unittest.TestCase):
         self.assertFalse(whitelist.targets.matches({"symbol": "SOL"}))
         self.assertTrue(whitelist.paired.matches({"symbol": "SOL"}))
 
-    def test_screen_pool_low_tvl(self):
+    def test_screen_pool_emits_low_tvl_as_fact(self):
+        # TVL filtering is Sheldon's policy; Missy emits all pools.
         pool = self.sample_pool()
         pool["tvl"] = 4000.0
         cand, reason = self.screener.screen_pool(pool)
-        self.assertIsNone(cand)
-        self.assertIn("TVL", reason)
+        self.assertIsNotNone(cand, f"Expected fact emission, got: {reason}")
+        self.assertEqual(cand.tvl, 4000.0)
 
-    def test_zero_volume_fails_positive_minimum(self):
+    def test_zero_volume_emitted_as_fact(self):
+        # Volume filtering is Sheldon's policy; Missy emits all pools.
         pool = self.sample_pool()
         pool["day"]["volume"] = 0
 
         candidate, reason = self.screener.screen_pool(pool)
 
-        self.assertIsNone(candidate)
-        self.assertIn("volume", reason)
+        self.assertIsNotNone(candidate, f"Expected fact emission, got: {reason}")
+        self.assertEqual(candidate.volume_window, 0)
 
     def test_malformed_pool_does_not_discard_valid_pool(self):
         malformed = self.sample_pool()
@@ -166,7 +169,8 @@ class TestScreener(unittest.TestCase):
             cand, f"Standard pool should skip tick gate, got: {reason}"
         )
 
-    def test_tick_spacing_gate_for_clmm(self):
+    def test_tick_spacing_not_gated_in_missy(self):
+        # Tick-spacing policy lives in Sheldon; Missy emits the pool as a fact.
         pool = self.sample_pool()
         pool["config"] = {"tickSpacing": 200}
         cfg = FilterConfig(
@@ -179,8 +183,8 @@ class TestScreener(unittest.TestCase):
         )
         s = RaydiumScreener(whitelist=self.wl, config=cfg)
         cand, reason = s.screen_pool(pool)
-        self.assertIsNone(cand)
-        self.assertIn("tick spacing", reason)
+        self.assertIsNotNone(cand, f"Expected fact emission, got: {reason}")
+        self.assertEqual(cand.tick_spacing, 200)
 
     def test_orca_pool_normalization(self):
         pool = {

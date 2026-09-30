@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from core.solana import is_valid_solana_address
 
 from .balance_calculator import BalanceCalculator
-from .config import USD_THRESHOLD, WRAPPED_SOL_MINT, resolve_rpc_url
+from .config import WRAPPED_SOL_MINT, resolve_rpc_url
 from .models import TokenBalance
 from .price_fetcher import TokenPriceFetcher
 from .rpc_client import SolanaRpcClient
@@ -21,7 +21,7 @@ class WalletScanner:
         self,
         rpc_url: Optional[str] = None,
         price_url: Optional[str] = None,
-        threshold_usd: float = USD_THRESHOLD,
+        threshold_usd: float = 0.0,
         timeout: float = 20.0,
         rpc_client: Optional[SolanaRpcClient] = None,
         price_fetcher: Optional[TokenPriceFetcher] = None,
@@ -35,23 +35,27 @@ class WalletScanner:
             self.price_fetcher = TokenPriceFetcher(base_url=price_url, timeout=timeout)
         else:
             self.price_fetcher = TokenPriceFetcher(timeout=timeout)
+        # Dust threshold is a policy decision owned by Sheldon. Missy emits
+        # all assets; the BalanceCalculator threshold is kept only for tests.
         self.calculator = BalanceCalculator(threshold_usd=threshold_usd)
 
     def scan(self, wallet: str) -> Dict[str, Any]:
-        """Fetch balances, price them, filter dust, and sort by USD value."""
+        """Fetch balances, price them, and return all assets sorted by USD value.
+
+        Dust filtering is a policy decision owned by Sheldon (see
+        scoring/capital.py DUST_MIN_USD). Missy emits all assets.
+        """
         if not is_valid_solana_address(wallet):
             raise ValueError("wallet must be a 32-byte Solana base58 address")
         balances = self._fetch_balances(wallet)
         prices = self._fetch_prices(balances)
         enriched = self.calculator.enrich(balances, prices)
-        filtered = self.calculator.filter_assets(enriched)
-        filtered.sort(key=lambda b: b.total_value_usd, reverse=True)
+        enriched.sort(key=lambda b: b.total_value_usd, reverse=True)
         return {
             "wallet": wallet,
-            "total_usd": round(sum(b.total_value_usd for b in filtered), 4),
-            "asset_count": len(filtered),
-            "assets": [b.to_dict() for b in filtered],
-            "threshold_usd": self.calculator.threshold_usd,
+            "total_usd": round(sum(b.total_value_usd for b in enriched), 4),
+            "asset_count": len(enriched),
+            "assets": [b.to_dict() for b in enriched],
         }
 
     def _fetch_balances(self, wallet: str) -> List[TokenBalance]:

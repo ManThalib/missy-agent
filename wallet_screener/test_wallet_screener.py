@@ -117,9 +117,10 @@ class TestWalletScanner(unittest.TestCase):
         )
         self.assertAlmostEqual(result["total_usd"], 540.0)
 
-    def test_scan_filters_dust(self):
+    def test_scan_emits_all_assets(self):
+        # Missy no longer filters dust; Sheldon's DUST_MIN_USD decides later.
         scanner = self._scanner(
-            prices={"dust-mint": 0.00001},
+            prices={"dust-mint": 0.01},
             lamports=0,
             accounts=[
                 {
@@ -128,13 +129,14 @@ class TestWalletScanner(unittest.TestCase):
                     "owner": "wallet",
                     "decimals": 6,
                     "raw_amount": "100",
-                    "ui_amount": 0.0001,
+                    "ui_amount": 0.1,
                 }
             ],
         )
         result = scanner.scan(VALID_WALLET)
-        self.assertEqual(result["asset_count"], 0)
-        self.assertEqual(result["total_usd"], 0.0)
+        # native SOL + the tiny token are both emitted
+        self.assertEqual(result["asset_count"], 2)
+        self.assertGreater(result["total_usd"], 0.0)
 
     def test_scan_rejects_invalid_wallet(self):
         scanner = self._scanner(prices={}, lamports=0, accounts=[])

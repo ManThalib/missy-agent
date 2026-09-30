@@ -17,7 +17,6 @@ if __package__ in (None, ""):
         sys.path.insert(0, _REPO_ROOT)
     from wallet_screener.config import (
         JUPITER_PRICE_URL,
-        USD_THRESHOLD,
         WALLET_ENV,
         resolve_wallet,
     )
@@ -25,7 +24,6 @@ if __package__ in (None, ""):
 else:
     from .config import (
         JUPITER_PRICE_URL,
-        USD_THRESHOLD,
         WALLET_ENV,
         resolve_wallet,
     )
@@ -51,8 +49,8 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=USD_THRESHOLD,
-        help="Minimum total USD value required to display an asset",
+        default=0.0,
+        help="Minimum total USD value required to display an asset (kept for CLI compatibility; scanner ignores it)",
     )
     parser.add_argument(
         "--rpc-url",
