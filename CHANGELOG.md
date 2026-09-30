@@ -2,6 +2,18 @@
 
 All notable changes to the Missy-agent Multi-DEX Screener Suite are documented here.
 
+## [Unreleased] - 2026-09-30
+
+### Changed
+
+- **Rename**: `wallet_scanner/` module and package renamed to `wallet_screener/`
+  to match its role as a screener rather than a scanner. All imports, scripts,
+  and tests updated.
+- Pool screener multi-DEX candidate handling and test suite updated for latest
+  provider normalizations.
+- Position screener closure state tracking and run script updated.
+- Documentation and agent notes refreshed.
+
 ## [Unreleased] - 2026-09-24
 
 ### Added
