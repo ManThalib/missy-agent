@@ -4,11 +4,15 @@
 
 The project has three cooperating packages plus a shared core:
 
-- `screener_py` discovers, normalizes, filters, scores, and displays pools.
+- `screener_py` discovers, normalizes, and emits pools as facts. Whitelist,
+  band, and scoring policy lives in Sheldon; Missy no longer rejects pools.
 - `screener_position_py` discovers wallet LP positions, normalizes Helius
-  transactions, tracks closures, and exposes conservative position analytics.
+  transactions, tracks closures, recomputes real Raydium CLMM pending
+  fees/rewards, enriches from the latest pool scan, and exposes conservative
+  position analytics.
 - `wallet_screener` fetches SOL/SPL/Token-2022 balances, prices them via Jupiter
-  Price API v2, filters dust, and reports a sorted USD portfolio.
+  Price API, and emits all assets sorted by USD value. Dust filtering is
+  Sheldon's policy.
 - `core` provides the shared HTTP, RPC, Helius, base58/Solana, normalization,
   display, price, and wallet-balance helpers reused by all three tools.
 
@@ -16,11 +20,15 @@ Only the Python standard library is used. Pool providers and current-position
 providers execute in bounded `ThreadPoolExecutor` workers. A failed source does
 not discard successful results. Pool discovery and current-position discovery
 raise only when every selected provider fails; a successful empty response is
-still a success.
+still a success. A failed position provider's records are marked
+`status=unknown` rather than reading as out-of-range evidence.
 
 The CLI does not submit transactions. Pool APIs are indexed data and must not
-be used as settlement state. Wallet scans can write the local
-`position_closure_state.json` file atomically.
+be used as settlement state. Wallet scans write timestamped JSON screens (and
+a symbol-keyed balance cache for the wallet runner). Position scans can write
+the local `position_closure_state.json` file atomically. Every scan and every
+position record carries `wallet_id` (default `main`) for the multi-wallet
+mirror; downstream consumers key on `wallet_id`, never the raw address.
 
 ## Directory Map
 
@@ -29,62 +37,68 @@ Missy-agent/
 |-- README.md
 |-- documentation.md
 |-- AGENTS.md
+|-- CHANGELOG.md
 |-- core/                               # Shared utilities
 |   |-- __init__.py
 |   |-- constants.py
 |   |-- display.py
 |   |-- helius.py
-|   |-- http.py
-|   |-- normalize.py
-|   |-- prices.py
+|   |-- http_client.py                # HttpJsonClient (+150 ms page pause)
+|   |-- normalize.py                  # finite_float/finite_number/integer/mapping/token_entry/...
+|   |-- prices.py                     # JupiterPriceClient (v3 default, v2 shapes parsed)
 |   |-- rpc.py
 |   |-- solana.py
 |   |-- test_core.py
 |   `-- wallet_balances.py
 |-- pool_screener/
 |   |-- pool_screener.py                # Pool CLI entrypoint
-|   |-- tokens.json                     # Token policy
+|   |-- run_meteora.sh                # Cron wrapper: --dex all --json --pages 1
+|   |-- tokens.json                     # Token metadata (asset/mint/aliases)
 |   |-- test_screener.py
 |   `-- screener_py/                    # Public pool facade and logic
 |       |-- __init__.py
 |       |-- constants.py                # Compatibility re-exports from core
 |       |-- candidate.py
 |       |-- candidate_json_encoder.py
-|       |-- filter_config.py
-|       |-- pool_score_input.py
-|       |-- pool_scorer.py
-|       |-- score_breakdown.py
-|       |-- scoring_config.py
-|       |-- token_config_parser.py
+|       |-- filter_config.py            # FilterConfig + TIMEFRAME_WINDOWS (parsed, not enforced)
+|       |-- pool_score_input.py         # Compatibility re-export from scoring
+|       |-- pool_scorer.py              # Compatibility re-export from scoring
+|       |-- score_breakdown.py          # Compatibility re-export from scoring
+|       |-- scoring_config.py           # Compatibility re-export from scoring
+|       |-- token_config_parser.py      # symbol/mint/address/asset/value + aliases
 |       |-- token_set.py
 |       |-- whitelist.py
-|       |-- multi_dex_screener.py
+|       |-- multi_dex_screener.py       # normalize_pool + fact-emitting MultiDexScreener
 |       |-- display.py
-|       |-- client.py
-|       |-- config.py
-|       |-- scoring.py
-|       |-- screener.py
+|       |-- client.py                   # Compatibility re-export from clients/
+|       |-- config.py                   # Compatibility re-export (DEFAULT_CONFIG)
+|       |-- scoring.py                  # PoolScoreInput/PoolScorer/ScoreBreakdown (retained for Sheldon)
+|       |-- screener.py                 # Compatibility re-export
 |       |-- normalize_utils.py          # Compatibility re-exports from core
 |       `-- clients/
 |           |-- __init__.py
-|           |-- base_client.py          # Compatibility re-export from core.http
+|           |-- base_client.py          # Compatibility re-export from core.http_client
 |           |-- raydium_client.py
 |           |-- orca_client.py
 |           |-- meteora_client.py
 |           `-- multi_dex_client.py
 |-- position_screener/
-|   |-- position_screener.py            # Position CLI entrypoint
+|   |-- position_screener.py            # Position CLI entrypoint (--wallet-id, --closure-state-path, --watch)
+|   |-- run_positions.sh              # Cron wrapper: --dex all --json --wallet-id "$WALLET_ID"
 |   |-- position_closure_state.json     # Local closure snapshot
 |   |-- test_positions.py
 |   `-- screener_position_py/           # Public position facade and logic
 |       |-- __init__.py
-|       |-- liquidity_position.py
-|       |-- position_scan.py
+|       |-- liquidity_position.py       # LiquidityPosition (+wallet_id, reward mints/decimals)
+|       |-- position_scan.py            # PositionScan (+wallet_id)
 |       |-- rpc_client.py               # Compatibility re-export from core.rpc
 |       |-- helius_history_client.py    # Compatibility re-export from core.helius
 |       |-- helius_parser.py
 |       |-- helius_types.py
-|       |-- position_scanner.py
+|       |-- position_scanner.py         # PositionScanner.scan(..., wallet_id, closure_state_path)
+|       |-- enrichment.py               # Pool-scan enrichment (value/range/fees/rewards)
+|       |-- raydium_pending.py          # Raydium CLMM SDK-port pending math + PDA derivation
+|       |-- test_raydium_pending.py
 |       |-- models.py
 |       |-- rpc.py
 |       |-- scanner.py
@@ -95,36 +109,42 @@ Missy-agent/
 |           |-- trader_scoring.py
 |           `-- closure_state.py
 `-- wallet_screener/
-    |-- main.py                         # Wallet screener CLI entrypoint
+    |-- main.py                         # Wallet CLI (--wallet-id, --threshold compat, --output-dir/--no-output-file)
+    |-- run_wallet.sh                 # Cron wrapper: wallet_screen[-<id>]-<TS>.json + balance cache
     |-- test_wallet_screener.py
-    |-- config.py
+    |-- config.py                     # No USD_THRESHOLD; JUPITER_PRICE_URL re-export; resolve_rpc_url/wallet
     |-- models.py
     |-- rpc_client.py                   # SolanaRpcClient with retry/backoff
-    |-- price_fetcher.py              # TokenPriceFetcher (Jupiter v2)
-    |-- balance_calculator.py         # USD valuation and threshold filter
-    `-- wallet_screener.py             # Orchestrator
+    |-- price_fetcher.py              # TokenPriceFetcher (Jupiter)
+    |-- balance_calculator.py         # enrich() prices all assets; filter_assets() kept for tests
+    `-- wallet_screener.py             # WalletScanner (+wallet_id, emits all assets)
 ```
 
 Compatibility modules contain imports only. Canonical implementations live in
-the modules named in the map.
+the modules named in the map (`core.http_client`, `core.normalize`,
+`core.prices`, `core.rpc`, `core.solana`, `screener_py.filter_config`,
+`screener_py.multi_dex_screener`, `screener_py.scoring`).
 
 ## Pool APIs
 
 ### `FilterConfig`
 
-`FilterConfig` contains discovery and screening settings. Important fields:
+`FilterConfig` contains discovery settings and retained threshold fields.
+Threshold fields are parsed from the CLI for compatibility but are **not
+enforced**: `MultiDexScreener.screen_pool()` emits every normalized pool as a
+fact and Sheldon applies policy downstream. Important fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `min_tvl`, `max_tvl` | `float` | USD TVL limits; zero maximum disables the cap. |
-| `min_fee_tvl` | `float` | Minimum daily LP fee/TVL percentage. |
-| `min_daily_fee` | `float` | Minimum normalized daily LP fees in USD. |
-| `min_volume_usd` | `float` | Minimum provider-window volume in USD. Missing/zero volume fails a positive minimum. |
-| `min_apr` | `float` | Minimum adjusted APR produced by `PoolScorer`. |
-| `min_bin_step`, `max_bin_step` | `int` | Meteora bin-step or concentrated-pool tick-spacing limits. Standard pools skip this gate. |
-| `min_fee_pct`, `max_fee_pct` | `float` | Pool fee-tier percentage limits. |
-| `max_volatility` | `float` | Maximum normalized price excursion percentage. |
-| `max_turnover_ratio` | `float` | Maximum normalized daily volume/TVL ratio. |
+| `min_tvl`, `max_tvl` | `float` | Retained USD TVL fields; zero maximum disables the cap. Not enforced by Missy. |
+| `min_fee_tvl` | `float` | Retained daily LP fee/TVL percentage. Not enforced. |
+| `min_daily_fee` | `float` | Retained normalized daily LP fees in USD. Not enforced. |
+| `min_volume_usd` | `float` | Retained provider-window volume in USD. Not enforced. |
+| `min_apr` | `float` | Retained adjusted APR field. Not enforced. |
+| `min_bin_step`, `max_bin_step` | `int` | Retained Meteora bin-step / concentrated tick-spacing fields. Not enforced. |
+| `min_fee_pct`, `max_fee_pct` | `float` | Retained fee-tier percentage fields. Not enforced. |
+| `max_volatility` | `float` | Retained price-excursion percentage. Not enforced. |
+| `max_turnover_ratio` | `float` | Retained daily volume/TVL field. Not enforced. |
 | `timeframe` | `str` | CLI values are `24h`, `7d`, or `30d`. |
 | `dex` | `str` | `all`, `meteora`, `raydium`, or `orca`. |
 | `pages`, `page_size`, `sort_field`, `timeout` | mixed | Discovery controls. |
@@ -192,30 +212,29 @@ price history only for the matching window; Meteora uses `min_price`,
 ### `MultiDexScreener`
 
 ```python
-screen_pool(pool: dict) -> tuple[Candidate | None, str]
+screen_pool(pool: dict, price_map: dict | None = None) -> tuple[Candidate | None, str]
 screen_all(pools: list[dict]) -> tuple[list[Candidate], dict[str, int]]
 fetch_and_screen(max_pages: int = 5) -> tuple[list[Candidate], dict[str, int]]
 ```
 
-The gate order is token policy, TVL, normalized LP fee/TVL, daily LP fees,
-volume, turnover, concentrated spacing, fee tier, volatility, and adjusted APR.
-Accepted candidates are sorted by descending score. `RaydiumScreener` and
-`MeteoraScreener` are compatibility aliases for `MultiDexScreener`, not
-provider-specific subclasses.
+`screen_pool()` normalizes, enriches (Jupiter token prices, RPC active-bin /
+current-tick), derives daily fees and fee/TVL, and returns a `Candidate` fact
+with `score=0.0`, `effective_tvl=tvl`, and zeroed APR/score buckets. Only
+malformed payloads return `(None, reason)`; `screen_all()` records those as
+`invalid provider payload` rejections instead of losing the batch. Accepted
+candidates are sorted by descending score (currently all neutral).
+`RaydiumScreener` and `MeteoraScreener` are compatibility aliases for
+`MultiDexScreener`, not provider-specific subclasses. On-chain tick decoding
+uses Meteora LbPair `activeId` at offset 76 (signed i32), Orca tick at offset
+81, and Raydium CLMM tick at offset 269.
 
 ### Pool Scoring
 
-`PoolScoreInput` is an immutable normalized observation. `PoolScorer.score()`
-returns immutable `ScoreBreakdown` with:
-
-- `total`, `yield_score`, `depth_score`, `efficiency_score`, `risk_score`
-- `realized_fee_apr`, `adjusted_apr`, `effective_tvl`
-- `daily_turnover`, `active_liquidity_factor`
-
-The score combines 25-point yield, depth, efficiency, and risk buckets.
-Reported APR is capped and blended with fee-derived APR. Missing volatility
-receives a neutral risk assumption rather than being interpreted as observed
-zero volatility. `ScoringConfig` controls weights and anchors.
+`PoolScoreInput` / `PoolScorer` / `ScoreBreakdown` / `ScoringConfig` are
+retained in `screener_py/scoring.py` for downstream (Sheldon) use. Missy does
+not call the scorer: emitted facts carry `score=0.0`,
+`realized_fee_apr=0.0`, `adjusted_apr=0.0`, and `0.0` for the yield/depth/
+efficiency/risk buckets, with `effective_tvl` equal to observed TVL.
 
 ### Candidate and Display
 
@@ -237,9 +256,11 @@ TokenConfigParser.load(filepath: str) -> dict[str, list[str]]
 
 The JSON root must be an object. `target_tokens` and `allowed_paired_tokens`
 accept arrays, a string, or an object. Object keys are checked in this order:
-`symbol`, `mint`, `address`, `asset`, `value`; the first non-empty string wins.
-Malformed entries are skipped. Invalid JSON raises `ValueError` with line and
-column; a missing file raises `FileNotFoundError`.
+`symbol`, `mint`, `address`, `asset`, `value`; the first non-empty string wins,
+and every string in the optional `aliases` array is added as an extra match
+literal. Malformed entries are skipped. Invalid JSON raises `ValueError` with line and
+column; a missing file raises `FileNotFoundError`. The shipped `tokens.json`
+uses `{"asset", "mint", "aliases"}` objects.
 
 ### `TokenSet` and `Whitelist`
 
@@ -262,27 +283,40 @@ from wallet_screener import WalletScanner
 result = WalletScanner().scan("YOUR_SOLANA_WALLET")
 ```
 
-`scan()` returns a dictionary containing the wallet address, the count of assets
-above the threshold, the total USD value of those assets, and a list of
-`TokenBalance` records serialized as dictionaries. Assets are sorted by
-`total_value_usd` in descending order.
+`scan()` returns a dictionary containing the wallet address, `wallet_id`
+(default `main`), the count of emitted assets, the total USD value of those
+assets, and a list of `TokenBalance` records serialized as dictionaries.
+Assets are sorted by `total_value_usd` in descending order. Missy emits all
+assets; dust filtering is Sheldon's policy.
 
 The constructor accepts:
 
 - `rpc_url`: Solana RPC URL. Defaults to `SOLANA_RPC_URL` or Helius RPC if
   `HELIUS_API_KEY` is set.
-- `price_url`: Jupiter Price API v2 base URL. Defaults to `JUPITER_PRICE_V2_URL`.
-- `threshold_usd`: Assets with total USD value at or below this value are
-  filtered out. Defaults to `$0.10`.
+- `price_url`: Jupiter Price API base URL. Defaults to `JUPITER_PRICE_V2_URL`
+  (which defaults to the v3 URL `https://api.jup.ag/price/v3`).
+- `threshold_usd`: Retained for compatibility and passed to
+  `BalanceCalculator`, but `scan()` uses `enrich()` (no filtering) and emits
+  all assets. Defaults to `0.0`.
 - `timeout`: Per-request timeout in seconds.
+- `wallet_id`: Logical wallet tag recorded in the scan output. Defaults to
+  `main`.
 - `rpc_client` / `price_fetcher`: Optional injected dependencies for testing or
   advanced use.
 
 The scanner validates that the wallet is a 32-byte base58 Solana address, fetches
 the native SOL balance plus all SPL and Token-2022 balances, prices mints in
-batches of 50 via Jupiter, and applies the threshold. Pricing failures are not
-fatal; affected assets are returned with `price_usd=0.0` and filtered out unless
-`threshold_usd` is set to `0.0`.
+batches of 50 via Jupiter, and enriches every balance. Pricing failures are not
+fatal; affected assets are returned with `price_usd=0.0`. `BalanceCalculator`
+still exposes `calculate()` and `filter_assets()` (threshold filter kept for
+tests), but the scanner path does not filter. Unknown mints keep an empty
+symbol; `KNOWN_MINT_SYMBOLS` resolves well-known USDC/USDT/wSOL mints locally.
+
+The CLI (`wallet_screener/main.py`) accepts `--wallet`, `--wallet-id`,
+`--threshold` (compat only), `--rpc-url`, `--price-url`, `--timeout`,
+`--watch`, `--json`, `--include-dust` (no-op), `--output-dir` (default
+`/data/missy-data/wallet_screens`), and `--no-output-file`. `--json --watch`
+is rejected; negative `--threshold`/`--watch` values are rejected.
 
 ### `TokenBalance`
 
@@ -318,11 +352,14 @@ automatic. The canonical implementation lives in `core.rpc`; the per-module
 
 ### Shared Core Helpers
 
-- `core.http.HttpJsonClient` — standard-library JSON GET/POST with a 150 ms
+- `core.http_client.HttpJsonClient` — standard-library JSON GET/POST with a 150 ms
   per-page pause.
-- `core.prices.JupiterPriceClient` — keyless Jupiter Price API v2 batch resolver.
+- `core.prices.JupiterPriceClient` — keyless Jupiter Price batch resolver
+  (defaults to v3 `https://api.jup.ag/price/v3`; parses v3 flat maps and v2
+  `data` map/list shapes).
 - `core.solana.b58encode` / `b58decode` / `discriminator` / `is_valid_solana_address`
-- `core.normalize.finite_number` / `mapping` / `token_entry`
+- `core.normalize.finite_float` / `finite_number` / `integer` / `mapping` /
+  `token_entry` / `top_level_token_metadata` / `safe_get`
 - `core.display.truncate` — terminal-width string truncation.
 - `core.wallet_balances` — `fetch_sol_balance_lamports`,
   `fetch_token_accounts`, and `ui_amount` used by both position and wallet
@@ -343,14 +380,25 @@ currently accumulated in memory before lifecycle parsing.
 ### `PositionScanner`
 
 ```python
-scan(wallet: str, dex: str = "all", history_pages: int = 0) -> PositionScan
+scan(
+  wallet: str,
+  dex: str = "all",
+  history_pages: int = 0,
+  closure_state_path: str | None = None,
+  wallet_id: str = "main",
+) -> PositionScan
 ```
 
 The scanner validates a 32-byte base58 wallet and DEX selection. It concurrently
 fetches current Meteora, Raydium, and Orca state, chunks NFT-position RPC
 batches, optionally reconstructs Helius history, merges by
-`(dex, position_address)`, and returns sorted positions. Current state wins over
-historical state while retaining known open metadata.
+`(dex, position_address)`, recomputes real Raydium CLMM pending fees/rewards
+from PoolState plus boundary tick arrays (stdlib SDK port in
+`raydium_pending.py`), enriches from the latest pool scan
+(`enrichment.py`: value, range, `fees_usd`/`rewards_usd`), tags every record
+with `wallet_id`, and returns sorted positions. Current state wins over
+historical state while retaining known open metadata. A failed provider's
+records are marked `status=unknown`.
 
 Source-specific failures are recorded in `PositionScan.errors`. History failure
 is non-fatal. If every selected current-state provider fails, `scan()` raises.
@@ -359,18 +407,34 @@ A provider returning no positions still counts as success.
 `attach_positions(candidates, positions)` mutates each candidate's
 `wallet_positions`, attaching non-closed records by exact `(dex, pool_address)`.
 
+### Raydium Pending Fees
+
+`raydium_pending.PendingFeesFetcher(rpc)` fetches the live PoolState and both
+boundary tick arrays and applies the raydium-sdk-v2 `PositionUtils` math
+(fee/reward growth-inside with u128 wrap, unmasked BN sums). Helpers include
+`decode_pool_state`, `decode_tick`, `tick_array_address` (PDA derivation),
+`fee_growth_inside_values`, `pending_fees`, `reward_growth_inside_values`,
+`pending_rewards`, and `raydium_position_checkpoint`. This overwrites the stale
+checkpointed `token_fees_owed_*` / `reward_amount_owed_*` fields, which never
+update until a claim. Reward mints/decimals are recorded for USD pricing.
+
 ### Position Records
 
-`LiquidityPosition` fields include DEX/pool/position identity, status, raw
-liquidity, raw tick/bin bounds, raw fee/reward legs, lifecycle signatures and
-times, source, and optional `pool_enrichment`.
+`LiquidityPosition` fields include DEX/pool/position identity, `wallet_id`,
+status, raw liquidity, raw tick/bin bounds, raw fee/reward legs plus
+`reward_mints`/`reward_decimals`, lifecycle signatures and times, source,
+derived `current_bin_id`/`in_range`/price/`fees_usd`/`rewards_usd`/`days_open`/
+`current_value_usd`/token amounts, and optional `pool_enrichment`.
 
 ```python
 position.to_dict(include_enrichment: bool = False) -> dict[str, Any]
 ```
 
 The result includes computed `has_claimable`. `PositionScan.to_dict()` emits
-wallet, positions, errors, and `history_complete`.
+`wallet`, `wallet_id`, positions, errors, and `history_complete`. The CLI adds
+`--wallet-id` (default `main`), `--closure-state-path` (default
+`position_closure_state.json`), `--watch`, `--show-inactive`,
+`--position-history-pages`, and `--dex`; `--json --watch` is rejected.
 
 ### Helius Normalization
 
@@ -442,25 +506,26 @@ distinct path.
 
 ## CLI Error Handling
 
-- Invalid numeric ranges and negative page/watch values are argument errors.
+- Invalid numeric ranges and negative page/watch/threshold values are argument errors.
 - A missing or malformed explicit token file exits with status 2.
 - A failed one-shot screening cycle exits with status 1.
 - Watch mode reports cycle failures and continues.
 - Partial pool-provider and position/history failures are warnings on stderr.
 - JSON serialization rejects NaN and infinity.
-- `--json --watch` is rejected.
+- `--json --watch` is rejected in all three CLIs.
 
 ## Environment Variables
 
 | Variable | Purpose |
 |---|---|
-| `RAYDIUM_API_BASE` | Override Raydium API base. |
-| `ORCA_API_BASE` | Override Orca API base. |
-| `METEORA_API_BASE` | Override Meteora API base. |
-| `SOLANA_RPC_URL` | Current-position Solana RPC endpoint. |
+| `RAYDIUM_API_BASE` | Override Raydium API base (default `https://api-v3.raydium.io`). |
+| `ORCA_API_BASE` | Override Orca API base (default `https://api.orca.so/v2/solana`). |
+| `METEORA_API_BASE` | Override Meteora API base (default `https://pool-discovery-api.datapi.meteora.ag`). |
+| `SOLANA_RPC_URL` | Current-position Solana RPC endpoint (pool active-bin/tick enrichment is opt-in). |
 | `HELIUS_API_KEY` | Enable Helius RPC fallback and lifecycle history. |
 | `WALLET_PUBLIC_KEY` | Default wallet for `wallet_screener/main.py`. |
-| `JUPITER_PRICE_V2_URL` | Override Jupiter Price API v2 endpoint. |
+| `JUPITER_PRICE_V2_URL` | Override Jupiter Price endpoint (default `https://api.jup.ag/price/v3`; v3 shapes parsed). |
+| `WALLET_ID` | Cron-wrapper logical wallet tag consumed by `run_positions.sh` / `run_wallet.sh` (default `main`). |
 
 The project does not load `.env` itself. Set variables before the Python process
 starts because provider constants are evaluated at import time.
@@ -469,21 +534,17 @@ starts because provider constants are evaluated at import time.
 
 ```bash
 python3 -m compileall -q .
-cd pool_screener
-python3 -m unittest test_screener
+cd pool_screener && python3 -m unittest test_screener
 python3 pool_screener.py --help
 python3 pool_screener.py --dex meteora --pages 1 --page-size 25
 
-cd ../position_screener
-python3 -m unittest test_positions
+cd ../position_screener && python3 -m unittest test_positions
 python3 position_screener.py --help
 
-cd ../wallet_screener
-python3 -m unittest test_wallet_screener
-python3 -m wallet_screener.main --help
+cd ../wallet_screener && python3 -m unittest test_wallet_screener
+python3 main.py --help
 
-cd ..
-python3 -m unittest core.test_core
+cd .. && python3 -m unittest core.test_core
 ```
 
 Before any future transaction path signs, it must re-read relevant on-chain

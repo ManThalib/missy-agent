@@ -2,6 +2,58 @@
 
 All notable changes to the Missy-agent Multi-DEX Screener Suite are documented here.
 
+## [Unreleased] - 2026-10-03
+
+### Changed
+
+- **Missy emits facts, Sheldon owns policy**: `MultiDexScreener.screen_pool()`
+  no longer rejects on whitelist/TVL/volume/fee-tier/spacing/volatility/APR.
+  Every normalized pool is emitted with a neutral `score=0.0`
+  (`effective_tvl` equals `tvl`; realized/adjusted APR and score buckets are
+  `0.0`). Filter flags remain parsed for CLI compatibility. Pool tests updated
+  to assert fact emission.
+- **Wallet dust policy moved to Sheldon**: `USD_THRESHOLD` removed from
+  `wallet_screener/config.py`; `BalanceCalculator` defaults to `0.0` and
+  `WalletScanner.scan()` uses `enrich()` with no filtering. `--threshold` is
+  compat-only (scanner ignores it); `--include-dust` is a no-op.
+- **Multi-wallet mirror**: every `PositionScan`, `LiquidityPosition`, and
+  wallet scan carries `wallet_id` (default `main`). New `--wallet-id` flags on
+  the position and wallet CLIs; `run_positions.sh` / `run_wallet.sh` pass
+  through `$WALLET_ID`. Mirror wallet screens write
+  `wallet_screen-<id>-<TS>.json` (main keeps unsuffixed names).
+
+### Added
+
+- **Raydium CLMM real pending math** (`position_screener/screener_position_py/raydium_pending.py`):
+  stdlib-only port of raydium-sdk-v2 `PositionUtils` (PoolState + boundary
+  tick-array reads, tick-array PDA derivation, u128 growth-inside semantics).
+  Active Raydium positions overwrite stale checkpointed owed fields; reward
+  mints/decimals recorded and priced (`enrichment.py` prices pair mints from
+  the pool record and third-party mints via Jupiter once per scan).
+  Includes `test_raydium_pending.py` (SDK vectors, PDA/curve ground truth,
+  layout offsets) plus degraded-provider tests.
+- **Degraded-provider marking**: positions from a failed provider are flagged
+  `status=unknown` instead of reading as out-of-range evidence.
+- **Wallet runner outputs**: `--output-dir` / `--no-output-file` on the wallet
+  CLI; `run_wallet.sh` refreshes the symbol-keyed `wallet_balances.json` cache.
+- **Token metadata**: `TokenConfigParser` now collects `aliases` arrays as
+  extra match literals; shipped `tokens.json` uses
+  `{asset, mint, aliases}` objects (targets add TAO/ZEC/XRP/XMR/QNT/ZBCN/GRASS/
+  VIRTUAL; paired set adds BTC/ETH/USD).
+
+### Fixed
+
+- Raydium CLMM `tickCurrent` offset `304 -> 269` (verified live on mainnet);
+  Meteora DLMM `activeId` decoded as signed i32 at LbPair offset 76; Orca
+  Position fee/reward offsets corrected.
+- Runner scripts scan `--dex all` (`run_meteora.sh` writes
+  `pool_scan-<TS>.json`; `run_positions.sh` writes `position_scan-<TS>.json`
+  with failure-context `.failed` records).
+- Shared defaults: `METEORA_API_BASE=https://pool-discovery-api.datapi.meteora.ag`,
+  `ORCA_API_BASE=https://api.orca.so/v2/solana`,
+  `JUPITER_PRICE_V2_URL=https://api.jup.ag/price/v3` (v3 shapes parsed);
+  shared client lives in `core/http_client.py`.
+
 ## [Unreleased] - 2026-09-30
 
 ### Changed
