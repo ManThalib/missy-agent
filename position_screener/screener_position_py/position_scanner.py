@@ -205,6 +205,7 @@ class PositionScanner:
         dex: str = "all",
         history_pages: int = 0,
         closure_state_path: Optional[str] = None,
+        wallet_id: str = "main",
     ) -> PositionScan:
         try:
             if len(_b58decode(wallet)) != 32:
@@ -291,6 +292,8 @@ class PositionScanner:
         merged = self._merge_positions(current, historical)
         self._mark_degraded_providers(merged, errors)
         self._refresh_raydium_pending(merged)
+        for position in merged:
+            position.wallet_id = wallet_id
 
         # Filter historical closed positions: keep only active/inactive
         # positions and closed positions that closed since the previous scan.
@@ -342,6 +345,7 @@ class PositionScanner:
 
         return PositionScan(
             wallet=wallet,
+            wallet_id=wallet_id,
             sol_balance_lamports=sol_balance_lamports,
             sol_price_usd=sol_price_usd,
             wallet_total_usd=wallet_total_usd,

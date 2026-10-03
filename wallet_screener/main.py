@@ -47,6 +47,12 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         help=f"Wallet public key (falls back to ${WALLET_ENV})",
     )
     parser.add_argument(
+        "--wallet-id",
+        type=str,
+        default="main",
+        help="Logical wallet tag recorded in the scan output (multi-wallet mirror)",
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
         default=0.0,
@@ -184,6 +190,7 @@ def main(argv: List[str] | None = None) -> int:
         price_url=args.price_url,
         threshold_usd=0.0 if args.include_dust else args.threshold,
         timeout=args.timeout,
+        wallet_id=args.wallet_id,
     )
 
     succeeded = run_cycle(args, scanner)

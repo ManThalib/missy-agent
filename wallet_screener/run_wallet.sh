@@ -29,9 +29,16 @@ fi
 mkdir -p "$OUTDIR"
 TS=$(date +%Y%m%d-%H%M%S)
 OUT="$OUTDIR/wallet_screen-$TS.json"
-LATEST="$OUTDIR/wallet_screen-latest.json"
+# wallet_id suffix for mirror wallets: wallet_screen-<id>-<TS>.json and
+# wallet_screen-<id>-latest.json (MAIN keeps the unsuffixed names so
+# existing consumers are untouched).
+WALLET_ID="${WALLET_ID:-main}"
+if [ "$WALLET_ID" != "main" ]; then
+  OUT="$OUTDIR/wallet_screen-$WALLET_ID-$TS.json"
+  LATEST="$OUTDIR/wallet_screen-$WALLET_ID-latest.json"
+fi
 cd "$REPO" || exit 1
-python3 main.py --json --output-dir "$OUTDIR" > "$OUT" 2>> "$LOG"
+python3 main.py --json --wallet-id "$WALLET_ID" --output-dir "$OUTDIR" > "$OUT" 2>> "$LOG"
 STATUS=$?
 if [ $STATUS -ne 0 ]; then
   echo "[$(date +%FT%T%z)] FAILED exit=$STATUS out=$OUT" >> "$LOG"

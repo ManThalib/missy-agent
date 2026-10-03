@@ -26,6 +26,15 @@ def parse_args(argv=None):
         help="Solana wallet whose active and historical LP positions are analyzed",
     )
     parser.add_argument(
+        "--wallet-id",
+        type=str,
+        default="main",
+        help=(
+            "Logical wallet tag recorded on every scan/position (multi-wallet "
+            "mirror: 'main' is the policy wallet, mirrors follow it)"
+        ),
+    )
+    parser.add_argument(
         "--dex",
         type=str,
         default="all",
@@ -82,6 +91,7 @@ def main() -> int:
                 dex=args.dex,
                 history_pages=args.position_history_pages,
                 closure_state_path=args.closure_state_path,
+                wallet_id=args.wallet_id,
             )
         except Exception as exc:
             # Full stack goes to stderr (cron.log) so failures carry context.

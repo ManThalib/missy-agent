@@ -9,6 +9,10 @@ LOG=/data/missy-data/position_scans/cron.log
 # Use Asia/Shanghai (UTC+8) for all timestamps and filenames.
 export TZ=Asia/Shanghai
 WALLET="${SOLANA_PUBLIC_WALLET:?SOLANA_PUBLIC_WALLET is required}"
+# wallet_id tags every scan/position record for the multi-wallet mirror.
+# MAIN is the policy wallet (Sheldon sizes from it); mirror wallets scan
+# with WALLET_ID=main overridden. Default: main.
+WALLET_ID="${WALLET_ID:-main}"
 # RPC credentials come from the injected environment (OpenClaw secrets store):
 # SOLANA_RPC_URL must be the full Helius endpoint including its api-key parameter.
 export SOLANA_RPC_URL="${SOLANA_RPC_URL:?SOLANA_RPC_URL is required (inject from secrets store)}"
@@ -25,7 +29,7 @@ OUT="$OUTDIR/position_scan-$TS.json"
 cd "$REPO" || exit 1
 # Buffer stderr so failure context can be embedded in the .failed record.
 ERRTMP=$(mktemp)
-python3 position_screener.py --wallet "$WALLET" --dex orca --json > "$OUT" 2> "$ERRTMP"
+python3 position_screener.py --wallet "$WALLET" --wallet-id "$WALLET_ID" --dex all --json > "$OUT" 2> "$ERRTMP"
 STATUS=$?
 cat "$ERRTMP" >> "$LOG"
 if [ $STATUS -ne 0 ]; then

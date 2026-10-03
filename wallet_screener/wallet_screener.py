@@ -25,7 +25,9 @@ class WalletScanner:
         timeout: float = 20.0,
         rpc_client: Optional[SolanaRpcClient] = None,
         price_fetcher: Optional[TokenPriceFetcher] = None,
+        wallet_id: str = "main",
     ) -> None:
+        self.wallet_id = (wallet_id or "main").strip() or "main"
         self.rpc = rpc_client or SolanaRpcClient(
             rpc_url or resolve_rpc_url(), timeout=timeout
         )
@@ -53,6 +55,7 @@ class WalletScanner:
         enriched.sort(key=lambda b: b.total_value_usd, reverse=True)
         return {
             "wallet": wallet,
+            "wallet_id": self.wallet_id,
             "total_usd": round(sum(b.total_value_usd for b in enriched), 4),
             "asset_count": len(enriched),
             "assets": [b.to_dict() for b in enriched],

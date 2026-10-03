@@ -24,6 +24,10 @@ class LiquidityPosition:
     # the slot is inactive). Set by the pending-fees recomputation.
     reward_mints: List[str] = field(default_factory=list)
     reward_decimals: List[int] = field(default_factory=list)
+    # Multi-wallet mirror: logical wallet tag ('main' = policy wallet).
+    # Set by the scanner from the scan's wallet_id; downstream consumers
+    # (Sheldon sizing, George legs) key on this, never on the raw address.
+    wallet_id: str = "main"
     opened_signature: str = ""
     closed_signature: str = ""
     opened_at: Optional[int] = None

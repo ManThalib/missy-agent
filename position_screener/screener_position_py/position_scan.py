@@ -11,6 +11,7 @@ class PositionScan:
     """Aggregate positions, source errors, and history completeness."""
 
     wallet: str
+    wallet_id: str = "main"
     sol_balance_lamports: int = 0
     sol_price_usd: float = 0.0
     wallet_total_usd: float = 0.0
@@ -22,6 +23,7 @@ class PositionScan:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "wallet": self.wallet,
+            "wallet_id": self.wallet_id,
             "sol_balance_lamports": self.sol_balance_lamports,
             "sol_price_usd": self.sol_price_usd,
             "wallet_total_usd": self.wallet_total_usd,
