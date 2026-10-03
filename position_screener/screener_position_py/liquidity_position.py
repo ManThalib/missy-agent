@@ -20,6 +20,10 @@ class LiquidityPosition:
     upper_bound: Optional[int] = None
     fees_owed_raw: List[int] = field(default_factory=list)
     rewards_owed_raw: List[int] = field(default_factory=list)
+    # Raydium CLMM only: mints of the 3 reward slots (system program id when
+    # the slot is inactive). Set by the pending-fees recomputation.
+    reward_mints: List[str] = field(default_factory=list)
+    reward_decimals: List[int] = field(default_factory=list)
     opened_signature: str = ""
     closed_signature: str = ""
     opened_at: Optional[int] = None

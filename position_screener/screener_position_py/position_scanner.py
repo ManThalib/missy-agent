@@ -25,6 +25,7 @@ from .analytics.closure_state import ClosureState
 from .enrichment import enrich_positions
 from .liquidity_position import LiquidityPosition
 from .position_scan import PositionScan
+from .raydium_pending import PendingFeesFetcher, raydium_position_checkpoint
 from .rpc_client import RpcClient
 
 METEORA_PROGRAM = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
@@ -86,6 +87,117 @@ class PositionScanner:
             HeliusHistoryClient(key, timeout=timeout) if key else None
         )
         self.webhook_parser = HeliusWebhookParser()
+        self.pending_fees = PendingFeesFetcher(self.rpc)
+        self._reward_decimals_cache: Dict[tuple, List[int]] = {}
+
+    def _refresh_raydium_pending(self, positions: List[LiquidityPosition]) -> None:
+        """Recompute real pending fees/rewards for Raydium CLMM positions.
+
+        PersonalPositionState checkpoint fields (token_fees_owed_* and
+        reward_amount_owed_*) only update when a claim touches the position,
+        so a never-claimed position reports 0 forever. Fetch the live
+        PoolState + boundary tick arrays and apply the SDK math
+        (raydium_pending.py, verified against raydium-sdk-v2 on mainnet).
+        Best-effort: a fetch/math failure records the error and keeps the
+        checkpointed values rather than zeroing the position.
+        """
+        if not any(p.dex == "raydium" and p.status == "active" for p in positions):
+            return
+        try:
+            accounts = self._fetch_raydium_position_accounts(
+                [p.position_address for p in positions
+                 if p.dex == "raydium" and p.status == "active"]
+            )
+        except Exception as exc:
+            for position in positions:
+                if position.dex == "raydium" and position.status == "active":
+                    if position.pool_enrichment is None:
+                        position.pool_enrichment = {}
+                    position.pool_enrichment["pending_fees_error"] = (
+                        f"position refetch failed: {exc}"
+                    )
+            return
+        for position in positions:
+            if position.dex != "raydium" or position.status != "active":
+                continue
+            data = accounts.get(position.position_address)
+            if data is None:
+                continue
+            try:
+                out = self.pending_fees.compute_pending(
+                    position.pool_address,
+                    position.lower_bound,
+                    position.upper_bound,
+                    position.liquidity_raw,
+                    raydium_position_checkpoint(data),
+                )
+            except Exception as exc:
+                if position.pool_enrichment is None:
+                    position.pool_enrichment = {}
+                position.pool_enrichment["pending_fees_error"] = str(exc)
+                continue
+            fees_raw = out["fees_owed_raw"]
+            rewards_raw = out["rewards_owed_raw"]
+            position.fees_owed_raw = [int(fees_raw[0]), int(fees_raw[1])]
+            position.rewards_owed_raw = [int(v) for v in rewards_raw]
+            position.reward_mints = [str(m) for m in out["reward_mints"]]
+            position.reward_decimals = self._reward_decimals(out["reward_mints"])
+            if position.pool_enrichment is None:
+                position.pool_enrichment = {}
+            position.pool_enrichment["pending_fees_source"] = "computed"
+
+    def _fetch_raydium_position_accounts(
+        self, addresses: Sequence[str]
+    ) -> Dict[str, Optional[bytes]]:
+        """Batch-fetch raw PersonalPositionState account data by address."""
+        import base64
+
+        out: Dict[str, Optional[bytes]] = {}
+        for start in range(0, len(addresses), _RPC_BATCH_SIZE):
+            batch = addresses[start : start + _RPC_BATCH_SIZE]
+            results = self.rpc.batch(
+                [("getAccountInfo", [a, {"encoding": "base64"}]) for a in batch]
+            )
+            for addr, res in zip(batch, results):
+                value = (res or {}).get("value")
+                out[addr] = (
+                    base64.b64decode(value["data"][0]) if value else None
+                )
+        return out
+
+    def _reward_decimals(self, mints: Sequence[str]) -> List[int]:
+        """Decimals for the reward mints (mint accounts, jsonParsed).
+
+        Placeholder/inactive mints (system program id) yield 0. Shared across
+        positions via a small cache; a failure leaves zeros, and enrichment
+        prices nothing it cannot scale.
+        """
+        if not mints:
+            return []
+        cache_key = tuple(mints)
+        cached = self._reward_decimals_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        unique = [m for m in dict.fromkeys(mints) if m and not m.startswith("1111")]
+        decimals: Dict[str, int] = {m: 0 for m in mints}
+        if unique:
+            try:
+                results = self.rpc.batch(
+                    [
+                        ("getAccountInfo", [m, {"encoding": "jsonParsed"}])
+                        for m in unique
+                    ]
+                )
+                for mint, res in zip(unique, results):
+                    info = (((res or {}).get("value") or {}).get("data") or {}).get(
+                        "parsed", {}
+                    ).get("info", {})
+                    decimals[mint] = int(info.get("decimals") or 0)
+            except Exception:
+                pass
+        out = [decimals[m] for m in mints]
+        self._reward_decimals_cache[cache_key] = out
+        return out
 
     def scan(
         self,
@@ -177,6 +289,8 @@ class PositionScanner:
             )
 
         merged = self._merge_positions(current, historical)
+        self._mark_degraded_providers(merged, errors)
+        self._refresh_raydium_pending(merged)
 
         # Filter historical closed positions: keep only active/inactive
         # positions and closed positions that closed since the previous scan.
@@ -558,6 +672,36 @@ class PositionScanner:
                 if name == wanted or name.endswith(wanted):
                     return pubkey
         return ""
+
+    @staticmethod
+    def _mark_degraded_providers(
+        positions: List[LiquidityPosition], errors: Dict[str, str]
+    ) -> None:
+        """Flag positions whose DEX provider failed this scan.
+
+        When a provider's RPC batch fails, the only records left for that
+        DEX come from history/fallback state, which lack live tick bounds.
+        Enrichment then defaults them to in_range=false, and a downstream
+        scorer can read that as verifiably out-of-range (the 2026-10-03
+        false REBALANCE). Mark such records status="unknown" so no
+        consumer treats absent data as range evidence.
+        """
+        degraded = {
+            name for name in ("meteora", "raydium", "orca")
+            if errors.get(name)
+        }
+        if "nft_inventory" in errors:
+            degraded.update(("raydium", "orca"))
+        if not degraded:
+            return
+        for position in positions:
+            if position.dex in degraded and position.status in ("active", "inactive"):
+                position.status = "unknown"
+                if position.pool_enrichment is None:
+                    position.pool_enrichment = {}
+                position.pool_enrichment["degraded_provider"] = errors.get(
+                    position.dex, "nft_inventory lookup failed"
+                )
 
     @staticmethod
     def _filter_closed_positions(

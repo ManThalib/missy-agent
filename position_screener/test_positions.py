@@ -89,6 +89,41 @@ class TestPositions(unittest.TestCase):
         self.assertEqual(position.fees_owed_raw, [7, 9])
         self.assertEqual(position.rewards_owed_raw, [11, 0, 0])
 
+    def test_degraded_provider_marks_unknown_status(self):
+        """RPC-failure fallback records must not read as live out-of-range
+        evidence: the failed provider's positions become status=unknown
+        (2026-10-03 false REBALANCE)."""
+        positions = [
+            LiquidityPosition("raydium", "r1", "pool-a", "inactive",
+                              lower_bound=None, upper_bound=None),
+            LiquidityPosition("meteora", "m1", "pool-b", "active",
+                              lower_bound=-100, upper_bound=100),
+            LiquidityPosition("raydium", "r2", "pool-a", "closed"),
+        ]
+        errors = {"raydium": "Batch RPC request failed: overloaded"}
+        PositionScanner._mark_degraded_providers(positions, errors)
+        self.assertEqual(positions[0].status, "unknown")
+        self.assertIn("degraded_provider", positions[0].pool_enrichment)
+        self.assertEqual(positions[1].status, "active")  # provider healthy
+        self.assertEqual(positions[2].status, "closed")  # closed stays closed
+
+    def test_degraded_providers_cleared_when_no_errors(self):
+        positions = [LiquidityPosition("raydium", "r1", "pool-a", "inactive")]
+        PositionScanner._mark_degraded_providers(positions, {})
+        self.assertEqual(positions[0].status, "inactive")
+
+    def test_nft_inventory_failure_degrades_nft_dexes(self):
+        positions = [
+            LiquidityPosition("raydium", "r1", "pool-a", "inactive"),
+            LiquidityPosition("orca", "o1", "pool-b", "inactive"),
+            LiquidityPosition("meteora", "m1", "pool-c", "active"),
+        ]
+        PositionScanner._mark_degraded_providers(
+            positions, {"nft_inventory": "boom"})
+        self.assertEqual(positions[0].status, "unknown")
+        self.assertEqual(positions[1].status, "unknown")
+        self.assertEqual(positions[2].status, "active")
+
     def test_attach_positions_matches_dex_and_pool(self):
         owned = candidate()
         same_address_other_dex = candidate(dex="raydium")

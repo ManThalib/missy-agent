@@ -172,6 +172,49 @@ def _sanitize_raw_amount(value: int, decimals: int = 9) -> float:
     return float(value) / (10 ** decimals)
 
 
+def _compute_rewards(
+    position: LiquidityPosition,
+    pool: Dict[str, Any],
+    extra_prices: Optional[Dict[str, float]] = None,
+) -> float:
+    """Convert raw pending reward amounts to USD.
+
+    Reward mints/decimals come from the Raydium pending-fees recomputation.
+    Pair-token rewards price from the pool record; third-party rewards (e.g.
+    RAY) price from ``extra_prices`` (Jupiter, fetched once per scan). Slots
+    with no price data contribute 0. The system-program placeholder mint
+    marks an inactive slot: raw amount is already 0, skip pricing.
+    """
+    rewards = position.rewards_owed_raw or []
+    mints = getattr(position, "reward_mints", None) or []
+    decimals = getattr(position, "reward_decimals", None) or []
+    if not rewards or len(mints) != len(rewards):
+        return 0.0
+    px, py, _, _ = _token_prices(pool)
+    mint_x = str(pool.get("token_x_address") or "")
+    mint_y = str(pool.get("token_y_address") or "")
+    extra_prices = extra_prices or {}
+    total = 0.0
+    for i, raw in enumerate(rewards):
+        raw = int(raw)
+        if raw <= 0:
+            continue
+        mint = mints[i]
+        dec = int(decimals[i]) if i < len(decimals) and decimals[i] is not None else 0
+        if dec <= 0:
+            continue
+        if mint == mint_x and px > 0:
+            price = px
+        elif mint == mint_y and py > 0:
+            price = py
+        else:
+            price = float(extra_prices.get(mint) or 0.0)
+        if price <= 0:
+            continue
+        total += raw / (10 ** dec) * price
+    return total
+
+
 def _compute_fees(position: LiquidityPosition, pool: Dict[str, Any]) -> float:
     """Convert raw fee amounts to USD using pool token prices."""
     px, py, dx, dy = _token_prices(pool)
@@ -186,7 +229,10 @@ def _compute_fees(position: LiquidityPosition, pool: Dict[str, Any]) -> float:
 
 
 def _enrich_one(
-    position: LiquidityPosition, pools: Dict[str, Dict[str, Any]], now: float
+    position: LiquidityPosition,
+    pools: Dict[str, Dict[str, Any]],
+    now: float,
+    rewards_cache: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Enrich a single position; raises so the caller can isolate failures."""
     pool = pools.get(position.pool_address)
@@ -278,6 +324,9 @@ def _enrich_one(
         position.in_range = lower <= current_bin <= upper
 
     position.fees_usd = _compute_fees(position, pool)
+    position.rewards_usd = _compute_rewards(
+        position, pool, rewards_cache.get("prices") if rewards_cache else None
+    )
     position.current_value_usd = _compute_value(position, pool)
     _dx = int(pool.get("token_x_decimals") or 0)
     _dy = int(pool.get("token_y_decimals") or 0)
@@ -327,9 +376,28 @@ def enrich_positions(
     pools = _load_pool_data(scan_path)
     now = time.time()
 
+    # Third-party reward tokens (e.g. RAY) price via Jupiter once per scan.
+    reward_mints = {
+        mint
+        for position in positions
+        for mint in (getattr(position, "reward_mints", None) or [])
+        if mint and not mint.startswith("1111")
+    }
+    rewards_cache: Dict[str, Any] = {"prices": {}}
+    if reward_mints:
+        try:
+            from core.prices import JupiterPriceClient
+
+            rewards_cache["prices"] = JupiterPriceClient().fetch_prices(
+                sorted(reward_mints)
+            )
+        except Exception as exc:
+            if errors is not None:
+                errors["reward_prices"] = str(exc)
+
     for position in positions:
         try:
-            _enrich_one(position, pools, now)
+            _enrich_one(position, pools, now, rewards_cache)
         except Exception as exc:
             # One bad pool record must not kill the whole scan.
             if position.pool_enrichment is None:
