@@ -241,9 +241,17 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day", price_map: Dict[st
         ]
         current_price = finite_float(pool.get("price"), "price")
         volatility = 0.0
-        volatility_available = timeframe == "7d" and current_price > 0 and bool(prices)
-        if volatility_available:
-            volatility = (max(prices) - min(prices)) / current_price * 100.0
+        volatility_available = False
+        if current_price > 0 and bool(prices):
+            if timeframe == "24h" and len(prices) >= 2:
+                # 14 points = 7 days (every 12h). Last 2 points cover the last 24h.
+                window_prices = prices[-2:] + [current_price]
+                volatility = (max(window_prices) - min(window_prices)) / current_price * 100.0
+                volatility_available = True
+            elif timeframe == "7d":
+                window_prices = prices + [current_price]
+                volatility = (max(window_prices) - min(window_prices)) / current_price * 100.0
+                volatility_available = True
         fee_rate = finite_float(pool.get("feeRate"), "fee rate") / 1_000_000.0
         tick_spacing = integer(pool.get("tickSpacing"), "tick spacing")
         current_tick_index = integer(
@@ -435,12 +443,22 @@ class MultiDexScreener:
         if self.rpc and dex_name == "meteora" and pool_type == "DLMM":
             active_bin_id = _fetch_active_bin_id(self.rpc, n.get("pool_address", ""))
             current_tick_index = active_bin_id
-        elif self.rpc and dex_name in ("orca", "raydium"):
+        elif self.rpc and dex_name in ("orca", "raydium") and pool_type.lower() != "standard":
             current_tick_index = int(n.get("current_tick_index") or 0)
             if current_tick_index == 0:
                 current_tick_index = _fetch_current_tick(
                     self.rpc, dex_name, n.get("pool_address", "")
                 )
+
+        pool_price = float(n.get("pool_price") or 0.0)
+        token_x_price_usd = float(n.get("token_x_price_usd") or 0.0)
+        token_y_price_usd = float(n.get("token_y_price_usd") or 0.0)
+
+        # Derive missing token prices using the pool price (X denominated in Y)
+        if token_x_price_usd == 0.0 and token_y_price_usd > 0.0 and pool_price > 0.0:
+            token_x_price_usd = token_y_price_usd * pool_price
+        elif token_y_price_usd == 0.0 and token_x_price_usd > 0.0 and pool_price > 0.0:
+            token_y_price_usd = token_x_price_usd / pool_price
 
         candidate = Candidate(
             pool_address=n.get("pool_address", ""),
@@ -472,13 +490,13 @@ class MultiDexScreener:
             efficiency_score=0.0,
             risk_score=0.0,
             lp_fee_share=lp_fee_share,
-            pool_price=float(n.get("pool_price") or 0.0),
+            pool_price=pool_price,
             token_x_address=n.get("token_x_address", ""),
             token_x_decimals=int(n.get("token_x_decimals") or 0),
-            token_x_price_usd=float(n.get("token_x_price_usd") or 0.0),
+            token_x_price_usd=token_x_price_usd,
             token_y_address=n.get("token_y_address", ""),
             token_y_decimals=int(n.get("token_y_decimals") or 0),
-            token_y_price_usd=float(n.get("token_y_price_usd") or 0.0),
+            token_y_price_usd=token_y_price_usd,
         )
         return candidate, ""
 

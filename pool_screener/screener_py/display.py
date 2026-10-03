@@ -23,7 +23,7 @@ def print_results(
         header = (
             f"{'DEX':<8} | {'POOL NAME':<12} | {'TYPE':<9} | {'TVL ($)':<10} | "
             f"{'FEES ($)':<10} | {'FEE/TVL':<9} | {'APR':<7} | "
-            f"{'VOL (%)':<7} | {'SCORE':<6} | "
+            f"{'VOLAT (%)':<9} | {'SCORE':<6} | "
         )
         header += "Pool Address"
         print(header)
@@ -40,7 +40,7 @@ def print_results(
                 f"{c.daily_fee_usd:<10.1f} | "
                 f"{c.fee_tvl_ratio:<8.2f}% | "
                 f"{c.apr:<6.1f}% | "
-                f"{c.volatility:<7.1f} | "
+                f"{c.volatility:<9.1f} | "
                 f"{c.score:<6.1f} | "
                 f"{c.pool_address}"
             )
