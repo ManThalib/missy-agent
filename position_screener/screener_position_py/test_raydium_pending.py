@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Tests for raydium_pending: SDK-verified math, PDA derivation, layouts.
 
-Test vectors generated 2026-10-03 from raydium-sdk-v2 PositionUtils
-(GetPositionFees / GetPositionRewards / getRewardGrowthInside) via
-/tmp/gen_vectors.cjs, plus live-chain PDA cross-checks against the SDK's
-getPdaTickArrayAddress (22/22 matches documented in PLAN.md).
+Test vectors in testdata/ray_vectors.json, generated from
+raydium-sdk-v2 PositionUtils (GetPositionFees / GetPositionRewards /
+getRewardGrowthInside) by testdata/gen_vectors.cjs (deterministic seed;
+regenerate: npm i @raydium-io/raydium-sdk-v2 bn.js && node gen_vectors.cjs).
+Live-chain PDA cross-checks against the SDK's getPdaTickArrayAddress
+(22/22 matches documented in PLAN.md).
 """
 
 import hashlib
@@ -36,7 +38,12 @@ U128 = (1 << 128) - 1
 def _vec(name):
     import json
 
-    cases = json.load(open("/tmp/ray_vectors.json"))
+    # Durable location first; /tmp legacy path as fallback.
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "testdata", "ray_vectors.json")
+    if not os.path.exists(path):
+        path = "/tmp/ray_vectors.json"
+    cases = json.load(open(path))
     return next(c for c in cases if c["name"] == name)
 
 
