@@ -10,6 +10,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .liquidity_position import LiquidityPosition
+from .position_features import build_position_features
 
 
 def _latest_pool_scan() -> Optional[str]:
@@ -363,6 +364,7 @@ def _enrich_one(
             "days_open": position.days_open,
         }
     )
+    position.position_features = build_position_features(position, pool)
 
 
 def enrich_positions(
@@ -410,3 +412,14 @@ def enrich_positions(
             if errors is not None:
                 key = position.pool_address or position.position_address
                 errors[f"enrichment:{key}"] = str(exc)
+        if position.position_features is None:
+            # Enrichment failed or had no pool record: still emit a degraded,
+            # honest feature block so consumers see the gap, not silence.
+            try:
+                position.position_features = build_position_features(
+                    position, pools.get(position.pool_address)
+                )
+            except Exception as exc:
+                if errors is not None:
+                    key = position.pool_address or position.position_address
+                    errors[f"features:{key}"] = str(exc)

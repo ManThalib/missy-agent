@@ -41,6 +41,9 @@ class LiquidityPosition:
     # Optional enrichment from a normalized pool snapshot; kept separate
     # so the core model stays protocol-agnostic.
     pool_enrichment: Optional[Dict[str, Any]] = field(default=None)
+    # Versioned feature vector (position_features.py). Features only — no
+    # score, no verdict. Sheldon consumes this under scoring.position_source.
+    position_features: Optional[Dict[str, Any]] = field(default=None)
     # Derived position metrics computed at scan time
     value_known: bool = True
     # Per-bin computed token amounts (raw chain units). Populated for
