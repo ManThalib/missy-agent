@@ -53,10 +53,34 @@ class WalletScanner:
         prices = self._fetch_prices(balances)
         enriched = self.calculator.enrich(balances, prices)
         enriched.sort(key=lambda b: b.total_value_usd, reverse=True)
+
+        # Ensure native SOL is priced and expose its USD price at the top level.
+        sol_balance = next((b for b in enriched if b.is_native_sol), None)
+        sol_price_usd = 0.0
+        if sol_balance is not None:
+            sol_price_usd = sol_balance.price_usd
+        if sol_price_usd <= 0:
+            try:
+                sol_price_usd = self.price_fetcher.fetch_prices(
+                    [WRAPPED_SOL_MINT]
+                ).get(WRAPPED_SOL_MINT, 0.0)
+            except Exception as exc:
+                print(f"Warning: SOL price fetch failed: {exc}", file=sys.stderr)
+                sol_price_usd = 0.0
+            if sol_price_usd > 0 and sol_balance is not None:
+                sol_balance.price_usd = sol_price_usd
+                sol_balance.total_value_usd = (
+                    sol_balance.amount_ui * sol_price_usd
+                )
+                enriched.sort(key=lambda b: b.total_value_usd, reverse=True)
+
+        total_usd = round(sum(b.total_value_usd for b in enriched), 4)
         return {
             "wallet": wallet,
             "wallet_id": self.wallet_id,
-            "total_usd": round(sum(b.total_value_usd for b in enriched), 4),
+            "sol_price_usd": round(sol_price_usd, 8),
+            "total_usd": total_usd,
+            "wallet_total_usd": total_usd,
             "asset_count": len(enriched),
             "assets": [b.to_dict() for b in enriched],
         }

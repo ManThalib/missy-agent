@@ -1,7 +1,10 @@
 """Concurrent aggregation of independent DEX pool clients."""
 
+import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from core.cache import DiskCache
 
 from ..filter_config import FilterConfig
 from .meteora_client import MeteoraClient
@@ -12,13 +15,24 @@ from .raydium_client import RaydiumClient
 class MultiDexClient:
     """Fetch providers concurrently while isolating individual failures."""
 
-    def __init__(self, timeout: float = 15.0) -> None:
+    def __init__(
+        self,
+        timeout: float = 15.0,
+        target_mints: Optional[List[str]] = None,
+        cache: Optional[DiskCache] = None,
+    ) -> None:
         self.errors: Dict[str, str] = {}
+        if cache is None and os.environ.get("MISSY_ENABLE_CACHE", "1") != "0":
+            cache = DiskCache(default_ttl_seconds=float(os.environ.get("MISSY_CACHE_TTL_SECONDS", "300")))
+        self.cache = cache
         self.clients: Dict[str, Any] = {
-            "raydium": RaydiumClient(timeout=timeout),
+            "raydium": RaydiumClient(timeout=timeout, target_mints=target_mints),
             "orca": OrcaClient(timeout=timeout),
             "meteora": MeteoraClient(timeout=timeout),
         }
+        if self.cache is not None:
+            for client in self.clients.values():
+                client.cache = self.cache
 
     def fetch_pools(
         self, config: FilterConfig, max_pages: int = 5

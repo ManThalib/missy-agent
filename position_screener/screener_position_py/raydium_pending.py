@@ -377,38 +377,52 @@ class PendingFeesFetcher:
 
     def __init__(self, rpc: RpcClient):
         self.rpc = rpc
+        # Per-scan caches: multiple positions in the same pool share one
+        # PoolState fetch and one TickArray batch instead of refetching
+        # identical accounts per position.
+        self._pool_state_cache: Dict[str, RaydiumPoolState] = {}
+        self._tick_arrays_cache: Dict[str, Dict[int, Optional[bytes]]] = {}
 
     def fetch_tick_arrays(
         self, pool_address: str, tick_spacing: int, ticks: Sequence[int]
     ) -> Dict[int, Optional[bytes]]:
         """Return start_index -> raw TickArray account data for the arrays
         that hold the requested ticks."""
-        starts = sorted({tick_array_start_index(t, tick_spacing) for t in ticks})
-        addresses = [tick_array_address(pool_address, s) for s in starts]
-        if not addresses:
-            return {}
-        result = self.rpc.batch(
-            [("getAccountInfo", [a, {"encoding": "base64"}]) for a in addresses]
+        cached = self._tick_arrays_cache.setdefault(pool_address, {})
+        starts = sorted(
+            s
+            for s in {tick_array_start_index(t, tick_spacing) for t in ticks}
+            if s not in cached
         )
-        out: Dict[int, Optional[bytes]] = {}
-        import base64
+        if starts:
+            addresses = [tick_array_address(pool_address, s) for s in starts]
+            result = self.rpc.batch(
+                [("getAccountInfo", [a, {"encoding": "base64"}]) for a in addresses]
+            )
+            import base64
 
-        for start, res in zip(starts, result):
-            value = (res or {}).get("value")
-            if not value:
-                out[start] = None
-                continue
-            out[start] = base64.b64decode(value["data"][0])
-        return out
+            for start, res in zip(starts, result):
+                value = (res or {}).get("value")
+                if not value:
+                    cached[start] = None
+                    continue
+                cached[start] = base64.b64decode(value["data"][0])
+        return {s: cached.get(s) for s in {
+            tick_array_start_index(t, tick_spacing) for t in ticks
+        }}
 
     def fetch_pool_state(self, pool_address: str) -> RaydiumPoolState:
+        if pool_address in self._pool_state_cache:
+            return self._pool_state_cache[pool_address]
         import base64
 
         result = self.rpc.call("getAccountInfo", [pool_address, {"encoding": "base64"}])
         value = (result or {}).get("value")
         if not value:
             raise ValueError(f"pool account not found: {pool_address}")
-        return decode_pool_state(base64.b64decode(value["data"][0]))
+        state = decode_pool_state(base64.b64decode(value["data"][0]))
+        self._pool_state_cache[pool_address] = state
+        return state
 
     def compute_pending(
         self,

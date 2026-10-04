@@ -145,6 +145,86 @@ class PositionScanner:
             if position.pool_enrichment is None:
                 position.pool_enrichment = {}
             position.pool_enrichment["pending_fees_source"] = "computed"
+            position.pending_fees_source = "computed"
+
+    def _refresh_orca_pending(self, positions: List[LiquidityPosition]) -> None:
+        """Best-effort reward-mint population for Orca Whirlpool positions.
+
+        Orca Position accounts already carry checkpointed feeOwedA/B, so we
+        keep those raw values and label the source. We do fetch the pool's
+        reward configuration so reward USD can be priced consistently with
+        Raydium positions.
+        """
+        active = [p for p in positions if p.dex == "orca" and p.status == "active"]
+        if not active:
+            return
+        pool_addresses = sorted({p.pool_address for p in active if p.pool_address})
+        pool_data: Dict[str, bytes] = {}
+        try:
+            for start in range(0, len(pool_addresses), _RPC_BATCH_SIZE):
+                batch = pool_addresses[start:start + _RPC_BATCH_SIZE]
+                results = self.rpc.batch(
+                    [("getAccountInfo", [a, {"encoding": "base64"}]) for a in batch]
+                )
+                for addr, res in zip(batch, results):
+                    value = (res or {}).get("value")
+                    data = value["data"][0] if value and isinstance(value.get("data"), list) else None
+                    if data:
+                        pool_data[addr] = base64.b64decode(data)
+        except Exception:
+            pass
+
+        reward_mints_by_pool: Dict[str, List[str]] = {}
+        for pool_address, data in pool_data.items():
+            try:
+                reward_mints_by_pool[pool_address] = self._decode_orca_pool_rewards(data)
+            except Exception:
+                reward_mints_by_pool[pool_address] = []
+
+        for position in active:
+            position.pending_fees_source = "raw_checkpoint"
+            if position.pool_enrichment is None:
+                position.pool_enrichment = {}
+            position.pool_enrichment["pending_fees_source"] = "raw_checkpoint"
+            mints = reward_mints_by_pool.get(position.pool_address, [])
+            if mints:
+                position.reward_mints = mints
+                position.reward_decimals = self._reward_decimals(mints)
+
+    @staticmethod
+    def _decode_orca_pool_rewards(data: bytes) -> List[str]:
+        """Return up to 3 reward mints from an Orca Whirlpool pool account.
+
+        Best-effort: the layout is the anchor Whirlpool state. Failures
+        return an empty list rather than raising.
+        """
+        if len(data) < 389:
+            return []
+        reward_info_start = 125
+        reward_info_stride = 88
+        mints: List[str] = []
+        for i in range(3):
+            offset = reward_info_start + i * reward_info_stride
+            if offset + 32 > len(data):
+                break
+            mint = _b58encode(data[offset:offset + 32])
+            mints.append(mint)
+        return mints
+
+    def _refresh_meteora_pending(self, positions: List[LiquidityPosition]) -> None:
+        """Label pending-fee source for Meteora DLMM positions.
+
+        Meteora positions already carry per-bin fee accumulations summed in
+        _fetch_meteora. Live DLMM fee-growth math is not yet implemented;
+        the raw summed values are retained and the source is flagged.
+        """
+        for position in positions:
+            if position.dex != "meteora" or position.status != "active":
+                continue
+            position.pending_fees_source = "raw_per_bin_sum"
+            if position.pool_enrichment is None:
+                position.pool_enrichment = {}
+            position.pool_enrichment["pending_fees_source"] = "raw_per_bin_sum"
 
     def _fetch_raydium_position_accounts(
         self, addresses: Sequence[str]
@@ -292,6 +372,8 @@ class PositionScanner:
         merged = self._merge_positions(current, historical)
         self._mark_degraded_providers(merged, errors)
         self._refresh_raydium_pending(merged)
+        self._refresh_orca_pending(merged)
+        self._refresh_meteora_pending(merged)
         for position in merged:
             position.wallet_id = wallet_id
 

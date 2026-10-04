@@ -6,7 +6,9 @@ import json
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from .cache import DiskCache
 
 PAGE_DELAY_SECONDS = 0.15
 _DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; PoolScreener/1.0)"
@@ -22,8 +24,18 @@ class HttpJsonClient:
     def __init__(self, base_url: str, timeout: float = 15.0) -> None:
         self.base_url = base_url
         self.timeout = timeout
+        self.cache: Optional[DiskCache] = None
+
+    def _cache_key(self, url: str) -> str:
+        return url
 
     def _get_json(self, url: str) -> Dict[str, Any]:
+        cache = self.cache
+        if cache is not None:
+            cached = cache.get("http", self._cache_key(url))
+            if cached is not None:
+                return cached
+
         request = urllib.request.Request(
             url,
             headers={
@@ -40,6 +52,8 @@ class HttpJsonClient:
             raise RuntimeError(f"API error: {data.get('msg') or 'unknown error'}")
         if not isinstance(data, dict):
             raise RuntimeError("API returned a non-object JSON payload")
+        if cache is not None:
+            cache.set("http", self._cache_key(url), value=data, ttl_seconds=300)
         return data
 
     @staticmethod

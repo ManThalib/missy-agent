@@ -116,6 +116,8 @@ class TestWalletScanner(unittest.TestCase):
             any(asset["is_native_sol"] for asset in result["assets"])
         )
         self.assertAlmostEqual(result["total_usd"], 540.0)
+        self.assertAlmostEqual(result["wallet_total_usd"], 540.0)
+        self.assertAlmostEqual(result["sol_price_usd"], 20.0)
 
     def test_scan_emits_all_assets(self):
         # Missy no longer filters dust; Sheldon's DUST_MIN_USD decides later.
@@ -142,6 +144,35 @@ class TestWalletScanner(unittest.TestCase):
         scanner = self._scanner(prices={}, lamports=0, accounts=[])
         with self.assertRaisesRegex(ValueError, "32-byte"):
             scanner.scan("not-a-wallet")
+
+    def test_scan_fetches_sol_price_when_missing(self):
+        """SOL is explicitly repriced when the first batch omits it."""
+        rpc = Mock(
+            get_balance_lamports=Mock(return_value=1_000_000_000),
+            get_token_accounts=Mock(return_value=[]),
+        )
+
+        calls = []
+
+        def _fetch_prices(mints):
+            calls.append(list(mints))
+            if "So11111111111111111111111111111111111111112" in mints:
+                # First request omits SOL; fallback request supplies it.
+                if len(calls) == 1:
+                    return {}
+                return {"So11111111111111111111111111111111111111112": 25.0}
+            return {}
+
+        price_fetcher = Mock(fetch_prices=Mock(side_effect=_fetch_prices))
+        scanner = WalletScanner(
+            rpc_client=rpc,
+            price_fetcher=price_fetcher,
+            threshold_usd=0.10,
+        )
+        result = scanner.scan(VALID_WALLET)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertAlmostEqual(result["sol_price_usd"], 25.0)
+        self.assertAlmostEqual(result["wallet_total_usd"], 25.0)
 
 
 if __name__ == "__main__":

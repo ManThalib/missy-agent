@@ -68,24 +68,25 @@ class TestScreener(unittest.TestCase):
         self.assertEqual(cand.whitelisted_token_symbol, "JUP")
         self.assertEqual(cand.paired_token_symbol, "SOL")  # WSOL normalized
 
-    def test_paired_token_policy_no_longer_applies_in_missy(self):
-        # Pair policy now lives in Sheldon; Missy emits the pool as a fact.
+    def test_paired_token_policy_rejects_unallowed_pair(self):
+        # Missy now enforces the target/paired policy; unknown pairs are dropped.
         pool = self.sample_pool()
         pool["mintB"] = {
             "symbol": "PEPE",
             "address": "PepeAddress111111111111111111111111111111111",
         }
         cand, reason = self.screener.screen_pool(pool)
-        self.assertIsNotNone(cand, f"Expected fact emission, got: {reason}")
+        self.assertIsNone(cand)
+        self.assertIn("paired token 'PEPE' is not an allowed paired asset", reason)
 
     def test_inverted_pair_orientation(self):
-        # Missy no longer applies pair policy; token_x/y order is preserved.
+        # Whitelist identifies the target token regardless of provider order.
         pool = self.sample_pool()
         pool["mintA"], pool["mintB"] = pool["mintB"], pool["mintA"]
         cand, reason = self.screener.screen_pool(pool)
         self.assertIsNotNone(cand, f"Expected pass, got: {reason}")
-        self.assertEqual(cand.whitelisted_token_symbol, "SOL")
-        self.assertEqual(cand.paired_token_symbol, "JUP")
+        self.assertEqual(cand.whitelisted_token_symbol, "JUP")
+        self.assertEqual(cand.paired_token_symbol, "SOL")
 
     def test_from_file_json(self):
         wl = Whitelist.from_file("tokens.json")
@@ -321,8 +322,8 @@ class TestScreener(unittest.TestCase):
         self.screener.rpc = self._rpc_returning_tick(81, 26191)
         candidate, _ = self.screener.screen_pool(self._orca_raw_pool())
         self.assertEqual(candidate.current_tick_index, 26191)
-        # active_bin_id stays a Meteora-only concept.
-        self.assertEqual(candidate.active_bin_id, 0)
+        # active_bin_id stays a Meteora-only concept (None = unknown for non-Meteora).
+        self.assertIsNone(candidate.active_bin_id)
         self.assertIn("current_tick_index", candidate.to_dict())
 
     def test_raydium_pool_enriches_current_tick_via_rpc(self):
@@ -330,9 +331,10 @@ class TestScreener(unittest.TestCase):
         candidate, _ = self.screener.screen_pool(self.sample_pool())
         self.assertEqual(candidate.current_tick_index, -5299)
 
-    def test_without_rpc_current_tick_stays_zero(self):
+    def test_without_rpc_current_tick_unknown(self):
         candidate, _ = self.screener.screen_pool(self._orca_raw_pool())
-        self.assertEqual(candidate.current_tick_index, 0)
+        # Without RPC the tick is unknown, not silently 0.
+        self.assertIsNone(candidate.current_tick_index)
 
     def test_candidate_serialization_matches_dataclass_shape(self):
         candidate, _ = self.screener.screen_pool(self.sample_pool())
@@ -439,6 +441,103 @@ class TestScreener(unittest.TestCase):
             pool_type="Standard",
         )
         self.assertAlmostEqual(scorer.score(daily).total, scorer.score(weekly).total)
+
+    def test_screen_all_injects_token_prices(self):
+        # Regression: phase-1 normalization ran before Jupiter prices were
+        # fetched, so all token USD prices ended up 0. screen_all must re-
+        # normalize with the price map before emitting candidates.
+        raw = self.sample_pool()
+        self.screener._fetch_pool_prices = lambda pools: {
+            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": 0.8,
+            SOL_MINT: 120.0,
+        }
+        candidates, _ = self.screener.screen_all([raw])
+        self.assertEqual(len(candidates), 1)
+        cand = candidates[0]
+        self.assertEqual(cand.token_x_symbol if hasattr(cand, "token_x_symbol") else "", "")
+        self.assertGreater(cand.token_x_price_usd, 0.0)
+        self.assertGreater(cand.token_y_price_usd, 0.0)
+
+    def test_raydium_clmm_reports_tick_not_bin(self):
+        cand, _ = self.screener.screen_pool(self.sample_pool())
+        self.assertEqual(cand.tick_unit, "tick")
+        self.assertEqual(cand.bin_step, 0)
+        self.assertEqual(cand.tick_spacing, 10)
+
+    def test_standard_pool_reports_no_tick_or_bin(self):
+        pool = self.sample_pool()
+        pool["type"] = "Standard"
+        cand, _ = self.screener.screen_pool(pool)
+        self.assertEqual(cand.tick_unit, "none")
+        self.assertEqual(cand.bin_step, 0)
+        self.assertEqual(cand.active_bin_id, 0)
+        self.assertEqual(cand.current_tick_index, 0)
+
+    def test_meteora_bin_not_tick_and_tick_equivalent(self):
+        # Use JUP as target token so the whitelist accepts the pool.
+        pool = {
+            "_dex": "meteora",
+            "pool_address": "MeteoraPool111111111111111111111111111111",
+            "token_x": {"symbol": "JUP", "address": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"},
+            "token_y": {"symbol": "SOL", "address": SOL_MINT},
+            "dlmm_params": {"bin_step": 4},
+            "active_bin_id": -5308,
+            "tvl": 1_000_000.0,
+            "volume": 100_000.0,
+            "fee": 1_000.0,
+            "apr": 50.0,
+            "fee_pct": 0.04,
+            "pool_price": 0.00833,
+            "min_price": 0.0082,
+            "max_price": 0.0085,
+            "volatility": 1.2,
+        }
+        normalized = normalize_pool(pool)
+        self.assertEqual(normalized["dex"], "meteora")
+        self.assertEqual(normalized["bin_step"], 4)
+        # screen_pool uses the discovery API value before RPC.
+        cand, _ = self.screener.screen_pool(
+            pool, tick_map={"MeteoraPool111111111111111111111111111111": -5308}
+        )
+        self.assertEqual(cand.tick_unit, "bin")
+        self.assertEqual(cand.bin_step, 4)
+        self.assertEqual(cand.tick_spacing, 4)
+        self.assertEqual(cand.active_bin_id, -5308)
+        self.assertIsNone(cand.current_tick_index)
+        # 1bp-tick equivalent should be in the same ballpark as CLMM ticks.
+        self.assertIsNotNone(cand.current_tick_equivalent)
+        self.assertLess(cand.current_tick_equivalent, 0)
+
+    def test_pool_price_orients_to_whitelisted_over_paired(self):
+        # Raydium lists JUP as mintA and WSOL as mintB, so the provider raw
+        # price is WSOL/JUP. The canonical pair is JUP-SOL, so the emitted
+        # pool_price should be JUP/SOL (the inverse of the raw price).
+        pool = self.sample_pool()
+        cand, _ = self.screener.screen_pool(pool)
+        # raw price in the sample is 0.5 (WSOL/JUP); oriented should be 2.0.
+        self.assertAlmostEqual(cand.pool_price_raw, 0.5)
+        self.assertAlmostEqual(cand.pool_price, 2.0)
+        self.assertEqual(cand.name, "JUP-SOL")
+        self.assertEqual(cand.provider_name, "JUP-WSOL")
+
+    def test_wsol_canonicalised_to_sol(self):
+        pool = self.sample_pool()
+        cand, _ = self.screener.screen_pool(pool)
+        self.assertEqual(cand.name, "JUP-SOL")
+        self.assertEqual(cand.paired_token_symbol, "SOL")
+
+    def test_provenance_fields_populated(self):
+        pool = self.sample_pool()
+        price_map = {
+            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": 0.8,
+            SOL_MINT: 120.0,
+        }
+        cand, _ = self.screener.screen_pool(pool, price_map=price_map)
+        self.assertTrue(cand.volatility_source)
+        self.assertTrue(cand.apr_source)
+        self.assertTrue(cand.apr_window)
+        self.assertEqual(cand.price_source, "jupiter_v2")
+        self.assertIn(cand.tick_source, {"none", "discovery_api", "rpc_batched", "rpc_single"})
 
     def test_projected_apr_is_capped_and_discounted(self):
         scorer = PoolScorer()

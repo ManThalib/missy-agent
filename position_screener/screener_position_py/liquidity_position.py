@@ -20,10 +20,15 @@ class LiquidityPosition:
     upper_bound: Optional[int] = None
     fees_owed_raw: List[int] = field(default_factory=list)
     rewards_owed_raw: List[int] = field(default_factory=list)
-    # Raydium CLMM only: mints of the 3 reward slots (system program id when
-    # the slot is inactive). Set by the pending-fees recomputation.
+    # Reward slot mints/decimals. Populated by live pending-fee recomputation
+    # (Raydium) or by reading the pool reward configuration (Orca/Meteora).
     reward_mints: List[str] = field(default_factory=list)
     reward_decimals: List[int] = field(default_factory=list)
+    # Provenance for pending fees/rewards:
+    #   "computed"          -> Raydium live fee-growth math
+    #   "raw_checkpoint"    -> Orca Position.feeOwedA/B checkpoint
+    #   "raw_per_bin_sum"   -> Meteora per-bin fee accumulation
+    pending_fees_source: str = ""
     # Multi-wallet mirror: logical wallet tag ('main' = policy wallet).
     # Set by the scanner from the scan's wallet_id; downstream consumers
     # (Sheldon sizing, George legs) key on this, never on the raw address.

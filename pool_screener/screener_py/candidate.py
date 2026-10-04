@@ -2,7 +2,7 @@
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -18,7 +18,7 @@ class Candidate:
     fee_tvl_ratio: float
     daily_fee_usd: float
     volume_window: float
-    bin_step: int  # CLMM tickSpacing; 0 for Standard/AMM pools (kept for CLI compat)
+    bin_step: int  # Meteora DLMM bin step (bps); 0 for Orca/Raydium/Standard
     fee_pct: float
     volatility: float
     score: float
@@ -47,8 +47,25 @@ class Candidate:
     token_y_address: str = ""  # Mint address of token_y
     token_y_decimals: int = 0  # Base-10 decimals of token_y
     token_y_price_usd: float = 0.0  # Token Y price in USD
-    active_bin_id: int = 0  # Active bin ID from DLMM LbPair account
-    current_tick_index: int = 0  # Live current tick/bin (orca whirlpool / raydium CLMM; = active_bin_id for meteora)
+    active_bin_id: Optional[int] = None  # Meteora DLMM active bin ID only; None = unknown/not DLMM
+    current_tick_index: Optional[int] = None  # Live 1bp tick (orca whirlpool / raydium CLMM); None for Meteora/unknown
+
+    # Cross-DEX comparable view of the current price (added so consumers do
+    # not have to reinterpret DEX-native tick/bin fields).
+    tick_unit: str = "none"  # "tick" (Orca/Raydium) | "bin" (Meteora) | "none"
+    current_price_ratio: float = 0.0  # atomic token_y/token_x ratio; 0.0 = unknown
+    current_tick_equivalent: Optional[int] = None  # current_price_ratio on the shared 1bp tick scale
+
+    # Normalised orientation / provenance (P1/P2).
+    pool_price_raw: float = 0.0  # provider-raw price before orientation
+    provider_name: str = ""  # raw provider pool name before canonicalisation
+    volatility_source: str = ""  # e.g. "raydium_range_24h"
+    volatility_window: str = ""  # e.g. "day"
+    apr_source: str = ""  # e.g. "fee/tvl annualized"
+    apr_window: str = ""  # e.g. "day"
+    tick_source: str = ""  # e.g. "rpc" | "discovery_api" | "none"
+    price_source: str = ""  # e.g. "jupiter_v2"
+    pending_fees_source: str = ""  # populated by position scanner
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the candidate to a JSON-compatible dictionary."""
@@ -83,6 +100,7 @@ class Candidate:
             "wallet_positions": [dict(position) for position in self.wallet_positions],
             # Meteora DLMM discovery API fields
             "pool_price": self.pool_price,
+            "pool_price_raw": self.pool_price_raw,
             "token_x_address": self.token_x_address,
             "token_x_decimals": self.token_x_decimals,
             "token_x_price_usd": self.token_x_price_usd,
@@ -91,4 +109,16 @@ class Candidate:
             "token_y_price_usd": self.token_y_price_usd,
             "active_bin_id": self.active_bin_id,
             "current_tick_index": self.current_tick_index,
+            "tick_unit": self.tick_unit,
+            "current_price_ratio": self.current_price_ratio,
+            "current_tick_equivalent": self.current_tick_equivalent,
+            # Provenance fields
+            "provider_name": self.provider_name,
+            "volatility_source": self.volatility_source,
+            "volatility_window": self.volatility_window,
+            "apr_source": self.apr_source,
+            "apr_window": self.apr_window,
+            "tick_source": self.tick_source,
+            "price_source": self.price_source,
+            "pending_fees_source": self.pending_fees_source,
         }

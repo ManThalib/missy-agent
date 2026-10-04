@@ -36,6 +36,8 @@ WALLET_ID="${WALLET_ID:-main}"
 if [ "$WALLET_ID" != "main" ]; then
   OUT="$OUTDIR/wallet_screen-$WALLET_ID-$TS.json"
   LATEST="$OUTDIR/wallet_screen-$WALLET_ID-latest.json"
+else
+  LATEST="$OUTDIR/wallet_screen-latest.json"
 fi
 cd "$REPO" || exit 1
 python3 main.py --json --wallet-id "$WALLET_ID" --output-dir "$OUTDIR" > "$OUT" 2>> "$LOG"
