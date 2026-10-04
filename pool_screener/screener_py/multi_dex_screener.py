@@ -17,7 +17,10 @@ from .normalize_utils import (
     token_entry,
     top_level_token_metadata,
 )
+from .pair_class import classify_pair_from_policy
+from .policy_loader import eligibility_gates, load_policy
 from .scoring import PoolScoreInput, PoolScorer
+from .scoring_config import ScoringConfig
 from .whitelist import Whitelist, normalize_symbol
 from core.prices import JupiterPriceClient
 
@@ -505,7 +508,8 @@ class MultiDexScreener:
             client = MultiDexClient(timeout=self.config.timeout, target_mints=target_mints)
         self.client = client
         self.rpc = rpc
-        self.scorer = PoolScorer()
+        self.policy = load_policy()
+        self.scorer = PoolScorer(ScoringConfig.from_policy(self.policy))
         self._jupiter_client: Optional[JupiterPriceClient] = None
 
     def _fetch_pool_prices(
@@ -577,10 +581,11 @@ class MultiDexScreener:
                     _apply(pool.get("tokenB"), price)
 
     def screen_pool(self, p: Dict[str, Any], price_map: Dict[str, float] = None, tick_map: Dict[str, Optional[int]] = None) -> Tuple[Optional[Candidate], str]:
-        """Normalize and enrich a raw pool, then emit it as a fact.
+        """Normalize, enrich, and score a raw pool.
 
-        Policy filtering (whitelist, TVL/volume bands, scoring, etc.) is now
-        owned by Sheldon. Missy only supplies clean, normalized observations.
+        The whitelist gate is still enforced here; pools that do not match
+        the configured universe are rejected. Pools that pass are emitted as
+        facts, including a default score and eligibility flag.
         """
         return self._screen_pool_internal(p, price_map=price_map, tick_map=tick_map)
 
@@ -742,6 +747,62 @@ class MultiDexScreener:
             current_tick_equivalent = UNKNOWN_TICK
 
         price_source = "jupiter_v2" if (token_x_price_usd > 0.0 or token_y_price_usd > 0.0) else "unavailable"
+
+        # Pair class / cohort tag (stable_stable, stable_bluechip, bluechip_bluechip).
+        pair_class = classify_pair_from_policy(whitelisted_symbol, paired_symbol, self.policy)
+
+        # Default score from Missy's model. reported_apr_pct is left as 0 because
+        # Missy's normalized `apr` is already fee/TVL annualized; we avoid double
+        # counting a provider-projected APR.
+        window_days = _WINDOW_DAYS.get(self.config.window, 1.0)
+        volatility_available = bool(n.get("volatility_available"))
+        score_input = PoolScoreInput(
+            tvl_usd=tvl,
+            fee_usd=gross_fee_window,
+            volume_usd=volume_window,
+            window_days=window_days,
+            reported_apr_pct=0.0,
+            volatility_pct=volatility if volatility_available else None,
+            fee_tier_pct=fee_pct,
+            lp_fee_share=lp_fee_share,
+            pool_type=pool_type,
+            pair_class=pair_class,
+            window_label=self.config.window,
+        )
+        breakdown = self.scorer.score(score_input)
+
+        # Pre-scoring eligibility gates. Pools that fail are still emitted so
+        # the audit trail survives, but `eligible` is false.
+        elig = eligibility_gates(self.policy)
+        turnover = volume_window / tvl if tvl > 0.0 else 0.0
+        rejection_reasons: List[str] = []
+        if tvl < elig["min_tvl_usd"]:
+            rejection_reasons.append(
+                f"tvl ${tvl:,.0f} < policy ${elig['min_tvl_usd']:,.0f}"
+            )
+        if volume_window < elig["min_volume_usd"]:
+            rejection_reasons.append(
+                f"volume ${volume_window:,.0f} < policy ${elig['min_volume_usd']:,.0f}"
+            )
+        if fee_tvl_ratio < elig["min_fee_tvl_ratio_pct"]:
+            rejection_reasons.append(
+                f"fee_tvl_ratio {fee_tvl_ratio:.4f}% < policy {elig['min_fee_tvl_ratio_pct']}%"
+            )
+        if volatility_available and volatility > elig["max_volatility_pct"]:
+            rejection_reasons.append(
+                f"volatility {volatility:.2f}% > policy {elig['max_volatility_pct']}%"
+            )
+        if turnover > elig["max_turnover_ratio"]:
+            rejection_reasons.append(
+                f"turnover {turnover:.2f} > policy {elig['max_turnover_ratio']}"
+            )
+        eligible = not rejection_reasons
+        rejected_reason = "; ".join(rejection_reasons)
+
+        scoring_meta = self.policy.get("scoring") or {}
+        score_model = str(scoring_meta.get("model", "missy-default"))
+        score_version = int(scoring_meta.get("version", 1))
+
         candidate = Candidate(
             pool_address=n.get("pool_address", ""),
             name=canonical_name,
@@ -756,8 +817,7 @@ class MultiDexScreener:
             bin_step=bin_step,
             fee_pct=fee_pct,
             volatility=volatility,
-            # Scoring is now Sheldon's job; Missy emits a neutral placeholder.
-            score=0.0,
+            score=breakdown.total,
             dex=str(n.get("dex") or "raydium"),
             pool_type=pool_type,
             apr=apr,
@@ -771,13 +831,13 @@ class MultiDexScreener:
             tick_source=tick_source,
             current_price_ratio=current_price_ratio,
             current_tick_equivalent=current_tick_equivalent,
-            effective_tvl=tvl,
-            realized_fee_apr=0.0,
-            adjusted_apr=0.0,
-            yield_score=0.0,
-            depth_score=0.0,
-            efficiency_score=0.0,
-            risk_score=0.0,
+            effective_tvl=breakdown.effective_tvl,
+            realized_fee_apr=breakdown.realized_fee_apr,
+            adjusted_apr=breakdown.adjusted_apr,
+            yield_score=breakdown.yield_score,
+            depth_score=breakdown.depth_score,
+            efficiency_score=breakdown.efficiency_score,
+            risk_score=breakdown.risk_score,
             lp_fee_share=lp_fee_share,
             pool_price=oriented_price,
             pool_price_raw=pool_price_raw,
@@ -791,6 +851,19 @@ class MultiDexScreener:
             volatility_window=n.get("volatility_window", ""),
             price_source=price_source,
             pending_fees_source="",
+            eligible=eligible,
+            rejected_reason=rejected_reason,
+            pair_class=pair_class,
+            score_model=score_model,
+            score_version=score_version,
+            score_breakdown={
+                "yield_score": round(breakdown.yield_score, 4),
+                "depth_score": round(breakdown.depth_score, 4),
+                "efficiency_score": round(breakdown.efficiency_score, 4),
+                "risk_score": round(breakdown.risk_score, 4),
+            },
+            daily_turnover=breakdown.daily_turnover,
+            active_liquidity_factor=breakdown.active_liquidity_factor,
         )
         return candidate, ""
 

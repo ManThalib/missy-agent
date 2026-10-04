@@ -28,6 +28,8 @@ from .multi_dex_screener import (
     RaydiumScreener,
     normalize_pool,
 )
+from .pair_class import classify_pair, classify_pair_from_policy
+from .policy_loader import PolicyError, eligibility_gates, load_policy
 from .scoring import PoolScoreInput, PoolScorer, ScoreBreakdown, ScoringConfig
 from .token_config_parser import TokenConfigParser
 from .token_set import TokenSet
@@ -59,6 +61,11 @@ __all__ = [
     "MultiDexScreener",
     "MeteoraScreener",
     "normalize_pool",
+    "load_policy",
+    "PolicyError",
+    "eligibility_gates",
+    "classify_pair",
+    "classify_pair_from_policy",
     "truncate",
     "print_results",
 ]

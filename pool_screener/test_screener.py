@@ -10,6 +10,8 @@ from unittest.mock import Mock
 
 from screener_py.client import MultiDexClient
 from screener_py.multi_dex_screener import _decode_active_bin_id, _decode_i32_at
+from screener_py.pair_class import classify_pair
+from screener_py.policy_loader import DEFAULT_POLICY, PolicyError, load_policy
 from screener_py.scoring import PoolScoreInput, PoolScorer
 from screener_py.screener import (
     FilterConfig,
@@ -568,6 +570,78 @@ class TestScreener(unittest.TestCase):
             scorer.score(net).realized_fee_apr,
             scorer.score(gross).realized_fee_apr * 0.8,
         )
+
+    # ------------------------------------------------------------------
+    # Phase 1: default score + eligibility emission
+    # ------------------------------------------------------------------
+
+    def test_candidate_carries_default_score_and_breakdown(self):
+        cand, _ = self.screener.screen_pool(self.sample_pool())
+        self.assertGreater(cand.score, 0.0)
+        self.assertEqual(cand.score_model, "missy-default")
+        self.assertEqual(cand.score_version, 1)
+        self.assertEqual(
+            set(cand.score_breakdown),
+            {"yield_score", "depth_score", "efficiency_score", "risk_score"},
+        )
+        # The four component scores must add up to the total (capped at 100).
+        self.assertAlmostEqual(
+            cand.score,
+            min(100.0, sum(cand.score_breakdown.values())),
+            places=3,
+        )
+        self.assertGreater(cand.realized_fee_apr, 0.0)
+        self.assertGreater(cand.effective_tvl, 0.0)
+        self.assertGreater(cand.daily_turnover, 0.0)
+        self.assertGreater(cand.active_liquidity_factor, 0.0)
+
+    def test_candidate_emits_eligible_flag_and_pair_class(self):
+        cand, _ = self.screener.screen_pool(self.sample_pool())
+        self.assertTrue(cand.eligible)
+        self.assertEqual(cand.rejected_reason, "")
+        # JUP is off-universe in Missy's default policy, so the cohort is
+        # tagged off_universe even though the whitelist accepted the pair.
+        self.assertEqual(cand.pair_class, "off_universe")
+
+    def test_ineligible_pool_is_still_emitted_with_reason(self):
+        pool = self.sample_pool()
+        pool["tvl"] = 4000.0  # below the policy min_tvl_usd of 25000
+        cand, reason = self.screener.screen_pool(pool)
+        self.assertIsNotNone(cand, f"Expected fact emission, got: {reason}")
+        self.assertFalse(cand.eligible)
+        self.assertIn("tvl", cand.rejected_reason)
+        self.assertEqual(cand.tvl, 4000.0)
+
+    def test_pair_class_matches_policy_universe(self):
+        self.assertEqual(classify_pair("USDC", "USDT", ["USDC", "USDT"], ["SOL"]), "stable_stable")
+        self.assertEqual(classify_pair("SOL", "USDC", ["USDC"], ["SOL"]), "stable_bluechip")
+        self.assertEqual(classify_pair("SOL", "ETH", ["USDC"], ["SOL", "ETH"]), "bluechip_bluechip")
+        self.assertEqual(classify_pair("JUP", "SOL", ["USDC"], ["SOL"]), "off_universe")
+
+    def test_policy_loader_defaults_when_missing(self):
+        policy = load_policy("/nonexistent/missy_policy.json")
+        self.assertEqual(policy["scoring"]["model"], DEFAULT_POLICY["scoring"]["model"])
+        self.assertIn("min_tvl_usd", policy["pool_eligibility"])
+
+    def test_policy_loader_rejects_invalid_file(self):
+        with NamedTemporaryFile(mode="w", suffix=".json") as policy_file:
+            policy_file.write('{"pool_eligibility": {"min_tvl_usd": "not-a-number"}}')
+            policy_file.flush()
+            with self.assertRaises(PolicyError):
+                load_policy(policy_file.name)
+
+    def test_screen_all_sorts_by_score_descending(self):
+        low = self.sample_pool()
+        low["id"] = "LowPool11111111111111111111111111111111111"
+        low["day"]["volumeFee"] = 10.0
+        low["day"]["volume"] = 2000.0
+        high = self.sample_pool()
+        high["id"] = "HighPool1111111111111111111111111111111111"
+        high["day"]["volumeFee"] = 5000.0
+        high["day"]["volume"] = 400000.0
+        candidates, _ = self.screener.screen_all([low, high])
+        self.assertEqual(len(candidates), 2)
+        self.assertGreaterEqual(candidates[0].score, candidates[1].score)
 
 
 if __name__ == "__main__":

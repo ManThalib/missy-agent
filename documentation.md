@@ -4,8 +4,9 @@
 
 The project has three cooperating packages plus a shared core:
 
-- `screener_py` discovers, normalizes, and emits pools as facts. Whitelist,
-  band, and scoring policy lives in Sheldon; Missy no longer rejects pools.
+- `screener_py` discovers, normalizes, scores, and emits pools as facts. Whitelist
+  and pre-scoring eligibility gates live in `missy_policy.json`. Sheldon owns
+  scoring *policy* and strategy; Missy owns the default score and feature vector.
 - `screener_position_py` discovers wallet LP positions, normalizes Helius
   transactions, tracks closures, recomputes real Raydium CLMM pending
   fees/rewards, enriches from the latest pool scan, and exposes conservative
@@ -54,13 +55,16 @@ Missy-agent/
 |   |-- pool_screener.py                # Pool CLI entrypoint
 |   |-- run_meteora.sh                # Cron wrapper: --dex all --json --pages 1
 |   |-- tokens.json                     # Token metadata (asset/mint/aliases)
+|   |-- missy_policy.json               # Missy eligibility + default scoring model
 |   |-- test_screener.py
 |   `-- screener_py/                    # Public pool facade and logic
 |       |-- __init__.py
 |       |-- constants.py                # Compatibility re-exports from core
 |       |-- candidate.py
 |       |-- candidate_json_encoder.py
-|       |-- filter_config.py            # FilterConfig + TIMEFRAME_WINDOWS (parsed, not enforced)
+|       |-- policy_loader.py          # Load/validate missy_policy.json (fail-closed)
+|       |-- pair_class.py             # Pair cohort classification
+|       |-- filter_config.py            # FilterConfig + TIMEFRAME_WINDOWS (parsed, not policy)
 |       |-- pool_score_input.py         # Compatibility re-export from scoring
 |       |-- pool_scorer.py              # Compatibility re-export from scoring
 |       |-- score_breakdown.py          # Compatibility re-export from scoring
@@ -131,8 +135,10 @@ the modules named in the map (`core.http_client`, `core.normalize`,
 
 `FilterConfig` contains discovery settings and retained threshold fields.
 Threshold fields are parsed from the CLI for compatibility but are **not
-enforced**: `MultiDexScreener.screen_pool()` emits every normalized pool as a
-fact and Sheldon applies policy downstream. Important fields:
+enforced** as the source of truth. The source of truth for Missy's eligibility
+gates is `missy_policy.json` (`pool_eligibility`). Pools that fail those gates
+are still emitted with `eligible: false` and a `rejected_reason` so that the
+audit trail survives. Important fields:
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -198,6 +204,41 @@ The normalized mapping uses these keys:
 | `fee`, `volume` | `float` | USD over the selected provider window. |
 | `fee_tvl_ratio` | `float` | Window fee/TVL percentage from source data. |
 | `apr` | `float` | Provider-reported annual percentage. |
+
+### Pool scoring
+
+Missy emits a default score for each whitelisted pool. The model, weights and
+anchors are configured in `missy_policy.json` (`scoring`) and read from the
+policy loader at screener start-up. The score is a 0-100 value made of four
+capped, log-scaled components:
+
+| Component | Field | Driver |
+|---|---|---|
+| Yield | `yield_score` | Risk-adjusted/realized fee APR. |
+| Depth | `depth_score` | Effective TVL (raw TVL discounted by liquidity model). |
+| Efficiency | `efficiency_score` | Window volume / effective TVL. |
+| Risk | `risk_score` | Volatility, concentration, fee-tier, and projected-APR divergence penalty. |
+
+For each candidate Missy also emits:
+
+| Field | Meaning |
+|---|---|
+| `score` | Total 0-100 score. |
+| `score_breakdown` | Dict of the four component scores. |
+| `score_model` / `score_version` | Model identity for reproducibility. |
+| `eligible` | `true` when all `pool_eligibility` gates pass. |
+| `rejected_reason` | Human-readable reason when `eligible` is `false`. |
+| `pair_class` | Cohort tag: `stable_stable`, `stable_bluechip`, `bluechip_bluechip`, `off_universe`. |
+| `realized_fee_apr` | Fee-based APR used by the model. |
+| `adjusted_apr` | Blended realized + projected APR. |
+| `effective_tvl` | Active-liquidity-adjusted TVL. |
+| `daily_turnover` | Window volume / effective TVL. |
+| `active_liquidity_factor` | Discount applied to concentrated liquidity pools. |
+
+Shetold may use the Missy default score directly or recompute its own score
+from the same feature vector for backtesting. Because rejected pools are still
+emitted, downstream consumers can decide whether to trust Missy's eligibility
+flag or apply their own gates during a transition period.
 | `fee_pct` | `float` | Fee tier percentage. |
 | `fee_rate` | `float` | Decimal fraction. Orca millionths are converted. |
 | `tick_spacing`, `bin_step` | `int` | One canonical concentrated-spacing value; `bin_step` is retained for compatibility. |

@@ -17,3 +17,6 @@ class PoolScoreInput:
     fee_tier_pct: float = 0.0
     lp_fee_share: float = 1.0
     pool_type: str = ""
+    pair_class: str = ""
+    window_label: str = ""
+    pool_age_days: Optional[float] = None

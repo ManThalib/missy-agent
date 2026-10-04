@@ -67,6 +67,22 @@ class Candidate:
     price_source: str = ""  # e.g. "jupiter_v2"
     pending_fees_source: str = ""  # populated by position scanner
 
+    # Phase 1: eligibility and score provenance.
+    # eligible: True if the pool passes Missy's pool_eligibility gates.
+    # rejected_reason: human-readable reason when eligible is False.
+    # pair_class: cohort tag (stable_stable, stable_bluechip, bluechip_bluechip,
+    #     off_universe) emitted so downstream consumers can cohort and backtest.
+    # score_model / score_version: identify which scoring model produced the
+    #     score and breakdown fields. Sheldon can pin or override these.
+    eligible: bool = True
+    rejected_reason: str = ""
+    pair_class: str = ""
+    score_model: str = ""
+    score_version: int = 0
+    score_breakdown: Dict[str, float] = field(default_factory=dict)
+    daily_turnover: float = 0.0
+    active_liquidity_factor: float = 1.0
+
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the candidate to a JSON-compatible dictionary."""
         return {
@@ -121,4 +137,13 @@ class Candidate:
             "tick_source": self.tick_source,
             "price_source": self.price_source,
             "pending_fees_source": self.pending_fees_source,
+            # Eligibility + score provenance (Phase 1)
+            "eligible": self.eligible,
+            "rejected_reason": self.rejected_reason,
+            "pair_class": self.pair_class,
+            "score_model": self.score_model,
+            "score_version": self.score_version,
+            "score_breakdown": dict(self.score_breakdown),
+            "daily_turnover": self.daily_turnover,
+            "active_liquidity_factor": self.active_liquidity_factor,
         }

@@ -1,0 +1,54 @@
+{
+  "_comment": "Missy policy: the pool-eligibility gates Missy enforces and the default scoring model it emits. This is the single source of truth for Missy's feature/score output. Sheldon owns strategy policy (thresholds, sizing, windows, execution rails) and may override or recompute the score for backtesting; George enforces execution rails only.",
+  "version": 1,
+
+  "universe": {
+    "stablecoins": ["USDC", "USDT", "USDG"],
+    "high_caps": [
+      "SOL", "WSOL",
+      "CBT", "WBTC", "CBBTC",
+      "ETH", "WETH",
+      "XRP", "cbXRP", "cbRXP",
+      "ZEC",
+      "TAO",
+      "XMR",
+      "BMT",
+      "QNT",
+      "VIRTUAL",
+      "ZBCN",
+      "GRASS"
+    ]
+  },
+
+  "pool_eligibility": {
+    "_comment": "Pre-scoring eligibility gates. A pool that fails is still emitted with eligible=false and rejected_reason so the audit trail survives.",
+    "min_tvl_usd": 25000,
+    "min_volume_usd": 5000,
+    "min_fee_tvl_ratio_pct": 0.05,
+    "max_volatility_pct": 50,
+    "max_turnover_ratio": 50
+  },
+
+  "scoring": {
+    "model": "missy-default",
+    "version": 1,
+    "weights": {
+      "yield": 25.0,
+      "depth": 25.0,
+      "efficiency": 25.0,
+      "risk": 25.0
+    },
+    "anchors": {
+      "yield_apr_pct": 50.0,
+      "depth_usd": 1000000.0,
+      "turnover_daily": 2.0,
+      "volatility_pct": 20.0,
+      "high_fee_pct": 1.0
+    },
+    "projected_apr": {
+      "weight": 0.30,
+      "premium_cap": 10.0,
+      "multiple_cap": 2.0
+    }
+  }
+}
