@@ -104,16 +104,6 @@ def _clmm_amounts(liquidity_raw: int, current_tick: int, lower: int, upper: int)
     return amount_x, amount_y
 
 
-def _meteora_amounts(liquidity_raw: int, pool: Dict[str, Any]) -> tuple:
-    """Meteora DLMM token amounts cannot be derived from liquidity_raw alone.
-
-    Per-bin share * bin reserves / bin liquidity_supply is required. Until
-    the scanner computes this from bin arrays, enrichment returns zero and
-    flags the value as unknown rather than emitting a bogus estimate.
-    """
-    return 0.0, 0.0
-
-
 def _derive_current_tick(pool: Dict[str, Any]) -> int:
     """Return best-effort current tick from pool scan fields."""
     tick = int(pool.get("current_tick_index") or pool.get("active_bin_id") or 0)
@@ -143,7 +133,11 @@ def _position_amounts(
             position.upper_bound or 0,
         )
     if dex == "meteora":
-        return _meteora_amounts(position.liquidity_raw, pool)
+        # Only the scanner's per-bin bin-math can produce DLMM amounts;
+        # liquidity shares alone cannot. None means unknown, not zero.
+        if position.amounts_x_raw is not None and position.amounts_y_raw is not None:
+            return float(position.amounts_x_raw), float(position.amounts_y_raw)
+        return 0.0, 0.0
     return 0.0, 0.0
 
 
@@ -329,16 +323,17 @@ def _enrich_one(
     _amount_x, _amount_y = _position_amounts(position, pool)
     position.current_value_usd = _compute_value(position, pool)
 
-    # Meteora DLMM value cannot be derived from liquidity_raw alone; flag it
-    # as unknown instead of trusting the zero/placeholder value.
-    if position.dex == "meteora":
+    # Meteora DLMM value requires the scanner's per-bin computed amounts;
+    # without them the value is unknown, not zero.
+    if position.dex == "meteora" and (
+        position.amounts_x_raw is None or position.amounts_y_raw is None
+    ):
         position.current_value_usd = 0.0
         position.value_known = False
-        _amount_x, _amount_y = 0.0, 0.0
         if position.pool_enrichment is None:
             position.pool_enrichment = {}
         position.pool_enrichment["value_known"] = False
-        position.pool_enrichment["value_source"] = "meteora_amounts_not_implemented"
+        position.pool_enrichment["value_source"] = "meteora_amounts_unavailable"
 
     position.token_x_amount = {
         "raw": str(int(_amount_x)) if _amount_x > 0 else "0",

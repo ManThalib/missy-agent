@@ -24,6 +24,7 @@ from .helius_types import NormalizedTransaction, ParsedInstruction
 from .analytics.closure_state import ClosureState
 from .enrichment import enrich_positions
 from .liquidity_position import LiquidityPosition
+from .meteora_pending import MeteoraPendingFeesFetcher
 from .position_scan import PositionScan
 from .raydium_pending import PendingFeesFetcher, raydium_position_checkpoint
 from .rpc_client import RpcClient
@@ -88,6 +89,7 @@ class PositionScanner:
         )
         self.webhook_parser = HeliusWebhookParser()
         self.pending_fees = PendingFeesFetcher(self.rpc)
+        self.meteora_fees = MeteoraPendingFeesFetcher(self.rpc)
         self._reward_decimals_cache: Dict[tuple, List[int]] = {}
 
     def _refresh_raydium_pending(self, positions: List[LiquidityPosition]) -> None:
@@ -212,12 +214,19 @@ class PositionScanner:
         return mints
 
     def _refresh_meteora_pending(self, positions: List[LiquidityPosition]) -> None:
-        """Label pending-fee source for Meteora DLMM positions.
+        """Compute live fees/rewards/token amounts for Meteora DLMM positions.
 
-        Meteora positions already carry per-bin fee accumulations summed in
-        _fetch_meteora. Live DLMM fee-growth math is not yet implemented;
-        the raw summed values are retained and the source is flagged.
+        Raw position accounts only carry per-bin checkpoint sums; the SDK
+        math in meteora_pending.py derives accrual since each checkpoint and
+        the position's per-bin token amounts (share * reserves / supply),
+        which raw liquidity shares alone cannot express. Best-effort: a
+        failure keeps the checkpointed fee sums, leaves amounts unknown (so
+        enrichment reports value_known=false instead of a bogus value), and
+        records the error on the position.
         """
+        active = [
+            p for p in positions if p.dex == "meteora" and p.status == "active"
+        ]
         for position in positions:
             if position.dex != "meteora" or position.status != "active":
                 continue
@@ -225,6 +234,49 @@ class PositionScanner:
             if position.pool_enrichment is None:
                 position.pool_enrichment = {}
             position.pool_enrichment["pending_fees_source"] = "raw_per_bin_sum"
+        if not active:
+            return
+        raw_accounts = self._fetch_meteora_position_accounts(
+            [p.position_address for p in active if p.position_address]
+        )
+        for position in active:
+            data = raw_accounts.get(position.position_address)
+            if data is None:
+                continue
+            try:
+                out = self.meteora_fees.compute_pending(
+                    position.pool_address, data
+                )
+            except Exception as exc:
+                position.pool_enrichment["meteora_compute_error"] = str(exc)
+                continue
+            fees_raw = out["fees_owed_raw"]
+            rewards_raw = out["rewards_owed_raw"]
+            position.fees_owed_raw = [int(fees_raw[0]), int(fees_raw[1])]
+            position.rewards_owed_raw = [int(v) for v in rewards_raw]
+            position.amounts_x_raw = int(out["amount_x_raw"])
+            position.amounts_y_raw = int(out["amount_y_raw"])
+            position.reward_mints = [str(m) for m in out.get("reward_mints") or []]
+            position.reward_decimals = self._reward_decimals(position.reward_mints)
+            position.pending_fees_source = "computed"
+            position.pool_enrichment["pending_fees_source"] = "computed"
+
+    def _fetch_meteora_position_accounts(
+        self, addresses: Sequence[str]
+    ) -> Dict[str, Optional[bytes]]:
+        """Batch-fetch raw Meteora position account data by address."""
+        out: Dict[str, Optional[bytes]] = {}
+        for start in range(0, len(addresses), _RPC_BATCH_SIZE):
+            batch = addresses[start:start + _RPC_BATCH_SIZE]
+            results = self.rpc.batch(
+                [("getAccountInfo", [a, {"encoding": "base64"}]) for a in batch]
+            )
+            for addr, res in zip(batch, results):
+                value = (res or {}).get("value")
+                out[addr] = (
+                    base64.b64decode(value["data"][0]) if value else None
+                )
+        return out
 
     def _fetch_raydium_position_accounts(
         self, addresses: Sequence[str]

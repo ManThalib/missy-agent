@@ -43,6 +43,11 @@ class LiquidityPosition:
     pool_enrichment: Optional[Dict[str, Any]] = field(default=None)
     # Derived position metrics computed at scan time
     value_known: bool = True
+    # Per-bin computed token amounts (raw chain units). Populated for
+    # Meteora DLMM positions when the live bin math succeeds; None means
+    # the amounts could not be derived and the USD value is unknown.
+    amounts_x_raw: Optional[int] = None
+    amounts_y_raw: Optional[int] = None
     current_bin_id: int = 0
     in_range: bool = False
     current_price: float = 0.0

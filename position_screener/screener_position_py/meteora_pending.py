@@ -95,7 +95,10 @@ _POSITION_SHARES_BASE = 72
 _POSITION_REWARDS_BASE = 1192
 _POSITION_FEES_BASE = 4552
 _POSITION_LOWER = 7912
-_POSITION_UPPER = 7915  # inclusive end of upper i32
+# upper_bin_id i32 lives at 7916 (right after lower@7912) — verified live
+# 2026-10-04: bytes 7912..7920 = 3debffff 81ebffff decode as two sane i32s,
+# while a 7915 read yields garbage (-1342977 on the live position).
+_POSITION_UPPER = 7916
 
 
 def _account_discriminator(name: str) -> bytes:
@@ -299,6 +302,11 @@ def compute_fees_and_rewards(
     fee_x = 0
     fee_y = 0
     rewards = [0, 0]
+    # SDK processPosition also accumulates the position's per-bin token
+    # amounts: posShare * bin reserves / bin liquiditySupply (BN trunc div).
+    # liquidity shares alone cannot express amounts; the bin rows can.
+    amount_x = 0
+    amount_y = 0
     limit_order = is_support_limit_order(pair)
 
     for bin_id in range(position.lower_bin_id, position.upper_bin_id + 1):
@@ -331,6 +339,13 @@ def compute_fees_and_rewards(
         fee_x += new_fee_x + position.fee_x_pending[idx]
         fee_y += new_fee_y + position.fee_y_pending[idx]
 
+        # Token amounts: share * reserves / supply, truncating per bin.
+        # A zero supply (or missing bin array -> empty row) contributes 0,
+        # matching the SDK's binSupply.eq(ZERO) guard.
+        if share != 0 and row.liquidity_supply != 0:
+            amount_x += _trunc_div(share * row.amount_x, row.liquidity_supply)
+            amount_y += _trunc_div(share * row.amount_y, row.liquidity_supply)
+
         # Rewards (skipped for limit-order pairs).
         if limit_order:
             continue
@@ -355,7 +370,12 @@ def compute_fees_and_rewards(
             )
             rewards[j] += new_reward + position.reward_pendings[idx][j]
 
-    return {"fees_owed_raw": [fee_x, fee_y], "rewards_owed_raw": rewards}
+    return {
+        "fees_owed_raw": [fee_x, fee_y],
+        "rewards_owed_raw": rewards,
+        "amount_x_raw": amount_x,
+        "amount_y_raw": amount_y,
+    }
 
 
 class MeteoraPendingFeesFetcher:
@@ -364,15 +384,25 @@ class MeteoraPendingFeesFetcher:
 
     def __init__(self, rpc: RpcClient):
         self.rpc = rpc
+        # Per-instance caches (mirrors the Raydium fetcher): multiple
+        # positions in the same pool share one LbPair fetch and one
+        # BinArray batch instead of refetching identical accounts.
+        self._lb_pair_cache: Dict[str, LbPairState] = {}
+        self._bin_array_cache: Dict[Tuple[str, int], Optional[bytes]] = {}
 
     def fetch_lb_pair(self, pool_address: str) -> LbPairState:
+        cached = self._lb_pair_cache.get(pool_address)
+        if cached is not None:
+            return cached
         import base64
 
         result = self.rpc.call("getAccountInfo", [pool_address, {"encoding": "base64"}])
         value = (result or {}).get("value")
         if not value:
             raise ValueError(f"lb pair not found: {pool_address}")
-        return decode_lb_pair(base64.b64decode(value["data"][0]))
+        state = decode_lb_pair(base64.b64decode(value["data"][0]))
+        self._lb_pair_cache[pool_address] = state
+        return state
 
     def fetch_bin_arrays(self, pool_address: str, lower_bin_id: int, upper_bin_id: int) -> Dict[str, bytes]:
         import base64
@@ -384,14 +414,25 @@ class MeteoraPendingFeesFetcher:
             }
         )
         addresses = [derive_bin_array(pool_address, i) for i in indexes]
-        results = self.rpc.batch(
-            [("getAccountInfo", [a, {"encoding": "base64"}]) for a in addresses]
-        )
+        missing = [
+            (i, addr)
+            for i, addr in zip(indexes, addresses)
+            if (pool_address, i) not in self._bin_array_cache
+        ]
+        if missing:
+            results = self.rpc.batch(
+                [("getAccountInfo", [a, {"encoding": "base64"}]) for _, a in missing]
+            )
+            for (i, _addr), res in zip(missing, results):
+                value = (res or {}).get("value")
+                self._bin_array_cache[(pool_address, i)] = (
+                    base64.b64decode(value["data"][0]) if value else None
+                )
         out: Dict[str, bytes] = {}
-        for addr, res in zip(addresses, results):
-            value = (res or {}).get("value")
-            if value:
-                out[addr] = base64.b64decode(value["data"][0])
+        for i, addr in zip(indexes, addresses):
+            data = self._bin_array_cache[(pool_address, i)]
+            if data:
+                out[addr] = data
         return out
 
     def fetch_clock(self) -> int:
@@ -416,9 +457,11 @@ class MeteoraPendingFeesFetcher:
         address_for = _address_resolver(pool_address, position.lower_bin_id, position.upper_bin_id)
         bin_arrays = self.fetch_bin_arrays(pool_address, position.lower_bin_id, position.upper_bin_id)
         timestamp = self.fetch_clock()
-        return compute_fees_and_rewards(
+        out = compute_fees_and_rewards(
             pool, position, bin_arrays, address_for, timestamp
         )
+        out["reward_mints"] = list(pool.reward_mints)
+        return out
 
 
 def _address_resolver(pool_address: str, lower_bin_id: int, upper_bin_id: int) -> dict:
