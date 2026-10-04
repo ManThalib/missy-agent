@@ -42,6 +42,7 @@ class LiquidityPosition:
     # so the core model stays protocol-agnostic.
     pool_enrichment: Optional[Dict[str, Any]] = field(default=None)
     # Derived position metrics computed at scan time
+    value_known: bool = True
     current_bin_id: int = 0
     in_range: bool = False
     current_price: float = 0.0

@@ -105,17 +105,13 @@ def _clmm_amounts(liquidity_raw: int, current_tick: int, lower: int, upper: int)
 
 
 def _meteora_amounts(liquidity_raw: int, pool: Dict[str, Any]) -> tuple:
-    """Best-effort token amounts for a Meteora DLMM position.
+    """Meteora DLMM token amounts cannot be derived from liquidity_raw alone.
 
-    Without per-bin share iteration we cannot derive exact amounts; return a
-    rough estimate proportional to liquidity and pool price.
+    Per-bin share * bin reserves / bin liquidity_supply is required. Until
+    the scanner computes this from bin arrays, enrichment returns zero and
+    flags the value as unknown rather than emitting a bogus estimate.
     """
-    pool_price = float(pool.get("pool_price") or 0.0)
-    if pool_price <= 0 or liquidity_raw <= 0:
-        return 0.0, 0.0
-    # Rough estimate: liquidity_raw is treated as a share-like quantity in the
-    # active bin. This is intentionally approximate.
-    return float(liquidity_raw) / pool_price, float(liquidity_raw)
+    return 0.0, 0.0
 
 
 def _derive_current_tick(pool: Dict[str, Any]) -> int:
@@ -166,8 +162,8 @@ def _compute_value(
 
 
 def _sanitize_raw_amount(value: int, decimals: int = 9) -> float:
-    """Convert a raw on-chain amount to UI, treating sentinels as zero."""
-    if value <= 0 or value >= (1 << 64) - 1 or value >= (1 << 32) - 1:
+    """Convert a raw on-chain amount to UI, treating only u64-max as sentinel."""
+    if value <= 0 or value >= (1 << 64) - 1:
         return 0.0
     return float(value) / (10 ** decimals)
 
@@ -281,6 +277,7 @@ def _enrich_one(
             position.upper_price = _finite_or_zero(
                 _tick_to_price_ratio(position.upper_bound or 0)
             )
+        position.current_bin_id = current_tick
         position.in_range = (
             position.lower_bound is not None
             and position.upper_bound is not None
@@ -320,17 +317,29 @@ def _enrich_one(
             position.current_price = float(active_bin)
             position.lower_price = float(lower)
             position.upper_price = float(upper)
-        current_bin = active_bin
-        position.in_range = lower <= current_bin <= upper
+        position.current_bin_id = active_bin
+        position.in_range = lower <= active_bin <= upper
 
     position.fees_usd = _compute_fees(position, pool)
     position.rewards_usd = _compute_rewards(
         position, pool, rewards_cache.get("prices") if rewards_cache else None
     )
-    position.current_value_usd = _compute_value(position, pool)
     _dx = int(pool.get("token_x_decimals") or 0)
     _dy = int(pool.get("token_y_decimals") or 0)
     _amount_x, _amount_y = _position_amounts(position, pool)
+    position.current_value_usd = _compute_value(position, pool)
+
+    # Meteora DLMM value cannot be derived from liquidity_raw alone; flag it
+    # as unknown instead of trusting the zero/placeholder value.
+    if position.dex == "meteora":
+        position.current_value_usd = 0.0
+        position.value_known = False
+        _amount_x, _amount_y = 0.0, 0.0
+        if position.pool_enrichment is None:
+            position.pool_enrichment = {}
+        position.pool_enrichment["value_known"] = False
+        position.pool_enrichment["value_source"] = "meteora_amounts_not_implemented"
+
     position.token_x_amount = {
         "raw": str(int(_amount_x)) if _amount_x > 0 else "0",
         "ui": _amount_x / (10 ** _dx) if _dx > 0 and _amount_x > 0 else 0.0,
