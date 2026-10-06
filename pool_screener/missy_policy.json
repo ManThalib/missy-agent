@@ -6,7 +6,7 @@
     "stablecoins": ["USDC", "USDT", "USDG"],
     "high_caps": [
       "SOL", "WSOL",
-      "CBT", "WBTC", "CBBTC",
+      "BTC", "CBT", "WBTC", "CBBTC",
       "ETH", "WETH",
       "XRP", "cbXRP", "cbRXP",
       "ZEC",
