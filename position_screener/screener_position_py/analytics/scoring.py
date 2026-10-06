@@ -3,10 +3,14 @@
 Raw tick/bin coordinates and token amounts are never treated as prices or a
 common quote currency. Components remain neutral until callers provide the
 required normalized enrichment.
+
+Also provides a Concentrated Yield Capture (CYC) scorer that separates
+pool-level yield potential from position-level capture efficiency.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -65,6 +69,12 @@ class PositionScoreInput:
     fee_value_delta_quote: Optional[float] = None
     # Time-window in seconds across which range-efficiency is measured
     observation_window_secs: int = 3600
+    # Optional pool-level context used by CYC model
+    pool_tvl_usd: Optional[float] = None
+    pool_type: str = ""
+    volatility_pct: Optional[float] = None
+    fee_tier_pct: float = 0.0
+    fees_apr_pct: float = 0.0
 
 
 @dataclass
@@ -236,6 +246,156 @@ class PositionScorer:
         return in_range / len(valid_snapshots)
 
 
+# ── module-level helpers for CYC model ─────────────────────────────
+
+def _safe_div(a, b, eps=1e-12):
+    """Safe division returning a / max(b, eps)."""
+    return a / max(b, eps)
+
+
+def _concentration_factor(lower: Optional[float],
+                          upper: Optional[float],
+                          current: Optional[float]) -> float:
+    """C = 1 / (1 - (P_lower/P_upper)^0.25) for CLMM-style ranges.
+
+    Returns 1.0 (neutral) when data is insufficient; caps at 200× to avoid
+    overflow from extreme price ratios.
+    """
+    if lower is None or upper is None or current is None or upper <= lower:
+        return 1.0
+    try:
+        c = 1.0 / (1.0 - (lower / upper) ** 0.25)
+        return max(1.0, min(c, 200.0))
+    except (ZeroDivisionError, ValueError, OverflowError):
+        return 1.0
+
+
+def _in_range_probability(vol_pct: Optional[float],
+                          lower: Optional[float],
+                          upper: Optional[float],
+                          current: Optional[float],
+                          window_secs: int) -> float:
+    """γ ≈ in-range probability via GBM estimation.
+
+    σ = annual volatility (decimal).  T_in ≈ (ln(P_up/P_0) · ln(P_0/P_low)) / σ²
+    gives expected years continuously in range.  γ = min(T_in / T_obs, 1.0)
+    where T_obs is the observation window in years.
+    Returns 0.5 when data is missing (neutral).
+    """
+    if vol_pct is None or lower is None or upper is None or current is None or window_secs <= 0:
+        return 0.5
+    sigma = max(vol_pct / 100.0, 1e-6)
+    try:
+        ln_up = math.log(max(upper / current, 1e-12))
+        ln_lo = math.log(max(current / lower, 1e-12))
+        t_in_years = (ln_up * ln_lo) / (sigma ** 2 + 1e-12)  # expected years
+        obs_years = window_secs / (365.0 * 24 * 3600)  # observation window in years
+        if obs_years <= 0 or t_in_years <= 0:
+            return 0.0
+        gamma = min(t_in_years / obs_years, 1.0)
+        return max(0.0, gamma)
+    except (ValueError, OverflowError, ZeroDivisionError):
+        return 0.5
+
+
+# ── Concentrated Yield Capture scorer ──────────────────────────────
+
+class CYCPositionScorer:
+    """Concentrated Yield Capture scorer (0-100).
+
+    Separates pool-level yield potential from position-level capture efficiency.
+    Four components: cyield_score (30%), cdepth_score (25%), cefficiency_score (25%),
+    crisk_score (20%). All computed from enrichment-data already available from
+    pool API scrapes -- no new RPC calls required.
+
+    .. note::
+       When ``concentration_factor`` and ``in_range_probability`` cannot be
+       derived (missing price data), the scorer falls back to neutral values so
+       that existing callers are unaffected.
+    """
+
+    def score(
+        self, score_input: "PositionScoreInput"
+    ) -> Tuple[Dict[str, float], float]:
+        """Score one position using the CYC model and return (component_dict, total_0_100)."""
+
+        # ── extract inputs ─────────────────────────────────────
+        current_price = score_input.current_price
+        lower_price = score_input.lower_price
+        upper_price = score_input.upper_price
+        fees_apr_pct = getattr(score_input, "fees_apr_pct", None) or 0.0
+        volatility_pct = getattr(score_input, "volatility_pct", None) or 0.0
+        pool_tvl_usd = getattr(score_input, "pool_tvl_usd", None) or 1_000_000.0
+        pool_type = getattr(score_input, "pool_type", "") or ""
+        observation_window = getattr(score_input, "observation_window_secs", 3600)
+
+        # ── concentration factor C ─────────────────────────────
+        C = _concentration_factor(lower_price, upper_price, current_price)
+
+        # ── in-range probability γ ─────────────────────────────
+        gamma = _in_range_probability(volatility_pct, lower_price, upper_price,
+                                       current_price, observation_window)
+
+        # ── CYC component: cyield_score (30%) ──────────────────
+        # raw fee APR adjusted for in-range probability.
+        # Fees are only earned when price is inside [lower, upper];
+        # gamma ∈ [0,1] is the estimated proportion of time price stays in range.
+        # Concentration factor C is captured separately in cefficiency_score
+        # and crisk_score, not used to inflate cyield when gamma≈0.
+        raw_fee_apr = max(fees_apr_pct, 0.0)
+        adjusted_fee_apr = raw_fee_apr * max(gamma, 0.0)
+        cyield_score = max(0.0, min(
+            math.log1p(adjusted_fee_apr) / math.log1p(50.0) * 30.0, 30.0))
+
+        # ── CYC component: cdepth_score (25%) ──────────────────
+        # active TVL = pool TVL × active_liquidity_factor (from pool_type)
+        active_factors = {"standard": 1.0, "concentrated": 0.75, "splash": 0.90,
+                         "dlmm": 0.75, "clmm": 0.75, "whirlpool": 0.75}
+        af = active_factors.get(pool_type.lower(), 1.0)
+        active_tvl = pool_tvl_usd * af
+        cdepth_score = max(0.0, min(
+            math.log1p(active_tvl) / math.log1p(1_000_000.0) * 25.0, 25.0))
+
+        # ── CYC component: cefficiency_score (25%) ─────────────
+        # pure concentration × in-range efficiency product
+        cefficiency_score = max(0.0, min(C * gamma * 25.0, 25.0))
+
+        # ── CYC component: crisk_score (20%) ───────────────────
+        # integrated risk penalty
+        # volatility risk (50% of penalty)
+        vol_risk = min(volatility_pct / 20.0, 1.0) if volatility_pct else 0.5
+        # concentration risk (20% of penalty) -- over-concentrated is bad
+        conc_risk = max(0.0, min(1.0 - C / 200.0, 1.0) if C else 0.0)
+        # boundary risk (15% of penalty) -- concept reuse from old model
+        if current_price is not None and lower_price is not None and upper_price is not None and upper_price > lower_price:
+            dist_to_lower = (current_price - lower_price) / (upper_price - lower_price)
+            dist_to_upper = (upper_price - current_price) / (upper_price - lower_price)
+            boundary_risk = max(0.0, 1.0 - min(0.02 / min(dist_to_lower, dist_to_upper), 1.0))
+        else:
+            boundary_risk = 0.5
+        # fee risk (10% of penalty)
+        fee_tier_pct = getattr(score_input, "fee_tier_pct", None) or 0.0
+        fee_risk = min(fee_tier_pct / 1.0, 1.0) if fee_tier_pct else 0.0
+        # weighted penalty
+        risk_penalty = (0.50 * vol_risk
+                        + 0.20 * conc_risk
+                        + 0.15 * boundary_risk
+                        + 0.10 * fee_risk)
+        crisk_score = max(0.0, min(25.0 * (1.0 - risk_penalty), 25.0))
+
+        # ── total ──────────────────────────────────────────────
+        total = (cyield_score + cdepth_score + cefficiency_score + crisk_score)
+
+        components = {
+            "cyield_score": round(cyield_score, 4),
+            "cdepth_score": round(cdepth_score, 4),
+            "cefficiency_score": round(cefficiency_score, 4),
+            "crisk_score": round(crisk_score, 4),
+        }
+
+        return components, round(total, 2)
+
+
 def score_tag(total: float) -> str:
     """Map 0-100 total to Optimal / Underperforming / Action Needed."""
     if total >= 75.0:
@@ -302,7 +462,7 @@ def format_duration(
     return f"{rem // 60}m {rem % 60}s"
 
 
-# ── convenience factory ──────────────────────────────────────────────
+# ── convenience factory ─────────────────────────────────────────────
 
 
 def from_liquidity_position(

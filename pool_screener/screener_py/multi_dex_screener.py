@@ -771,6 +771,10 @@ class MultiDexScreener:
         )
         breakdown = self.scorer.score(score_input)
 
+        # Fee‑capture model will be stored after the Candidate is built
+        # (see the assignment after the Candidate constructor below).
+        new_breakdown = self.scorer.score_fee_capture(score_input)
+
         # Pre-scoring eligibility gates. Pools that fail are still emitted so
         # the audit trail survives, but `eligible` is false.
         elig = eligibility_gates(self.policy)
@@ -865,6 +869,16 @@ class MultiDexScreener:
             daily_turnover=breakdown.daily_turnover,
             active_liquidity_factor=breakdown.active_liquidity_factor,
         )
+        # Store new fee‑capture model results
+        candidate.new_fc_score = new_breakdown["fc_score"]
+        candidate.new_score_breakdown = {
+            "fee_yield_score": new_breakdown["fee_yield_score"],
+            "absolute_fee_score": new_breakdown["absolute_fee_score"],
+            "liquidity_effectiveness": new_breakdown["liquidity_effectiveness"],
+            "turnover_penalty_score": new_breakdown["turnover_penalty_score"],
+            "lp_share_adjustment": new_breakdown["lp_share_adjustment"],
+        }
+        candidate.new_score_model = "new_scoring_model_for_pool"
         return candidate, ""
 
     def screen_all(

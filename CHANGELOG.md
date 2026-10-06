@@ -2,6 +2,79 @@
 
 All notable changes to the Missy-agent Multi-DEX Screener Suite are documented here.
 
+## [Unreleased] - 2026-10-06
+
+### Added
+
+- **Fee-capture pool scoring** (`pool_screener/screener_py/pool_scorer.py`):
+  `PoolScorer.score_fee_capture()` emits a second 0-100 model alongside the
+  default score. Weights: fee-yield 35 (log-scaled fee/TVL, 0.05%-5% band),
+  absolute-fee 25 ($200/day benchmark), liquidity-effectiveness 20
+  (volatility centered at 15%), turnover-penalty 10 (erodes past 20x
+  TVL/day), LP-share 10. Results land on
+  `Candidate.new_fc_score` / `new_score_breakdown` / `new_score_model`.
+- **Concentrated Yield Capture position scorer**
+  (`position_screener/screener_position_py/analytics/scoring.py`):
+  `CYCPositionScorer` separates pool-level yield potential from
+  position-level capture efficiency (`cyield`/`cdepth`/`cefficiency`/`crisk`
+  components from existing enrichment data, no new RPC calls).
+  `PositionScoreInput` gains optional pool context (`pool_tvl_usd`,
+  `pool_type`, `volatility_pct`, `fee_tier_pct`, `fees_apr_pct`).
+- **Versioned position feature vector**
+  (`position_screener/screener_position_py/position_features.py`):
+  every scanned position carries a `position_features` block
+  (`FEATURES_VERSION=1`: identity, range geometry, value/fees/rewards,
+  pool context, plus a `gaps` list for missing inputs). Features only, no
+  score, no verdict; Sheldon scores downstream.
+- **Meteora DLMM live pending math** (`meteora_pending.py`): stdlib port of
+  the `@meteora-ag/dlmm` SDK per-bin fee/reward loop (fee-per-liquidity
+  checkpoints, active-bin reward advancement), verified against the SDK on
+  live mainnet accounts. Positions report live pending amounts plus real
+  token amounts instead of raw per-bin checkpoint sums.
+- **Orca Whirlpool live pending math** (`orca_pending.py`): stdlib port of
+  the whirlpools-sdk `collectFeesQuote` / `collectRewardsQuote`
+  (fee/reward growth-inside math), replacing stale checkpointed
+  `feeOwedA/B` / `amountOwed` fields.
+- **SDK test vectors** (`testdata/gen_vectors.cjs`, `ray_vectors.json`):
+  durable Raydium SDK ground-truth vectors plus Meteora amount tests
+  (`test_meteora_amounts.py`) and feature tests
+  (`test_position_features.py`).
+- **Disk cache** (`core/cache.py`): `DiskCache` with per-key TTL (default
+  300 s, `$MISSY_CACHE_DIR` or `/tmp/missy-cache`), wired into provider
+  JSON fetches and the pending-fee RPC fetcher (per-pool PoolState /
+  tick-array caching: N positions in one pool cost 2 RPC calls, not 2N).
+
+### Changed
+
+- **Missy Phase 1 scoring**: Missy now emits a default 0-100 pool score and
+  pre-scoring eligibility gates from `pool_screener/missy_policy.json`
+  (`pool_eligibility`: min TVL $25k, min volume $5k, min fee/TVL 0.05%, max
+  volatility 50%, max turnover 50x; `scoring`: equal 25/25/25/25
+  yield/depth/efficiency/risk weights with anchors). Failing pools are still
+  emitted with `eligible: false` and `rejected_reason` so the audit trail
+  survives. `policy_loader.py` loads/validates the policy fail-closed with a
+  built-in default fallback; `pair_class.py` tags cohorts (`stable_stable`,
+  `stable_bluechip`, `bluechip_bluechip`, `off_universe`). `Candidate`
+  gains `eligible`, `rejected_reason`, `pair_class`, `score_model`,
+  `score_version`, `score_breakdown`, `daily_turnover`, and
+  `active_liquidity_factor`.
+- **Pool screener speedup**: whitelist pre-filter in `screen_all()` runs
+  before Jupiter/RPC enrichment (~117 s to ~2.9 s per scan); Raydium
+  discovery uses targeted `poolsByMint` (1 page/mint) instead of full pages.
+- **Orca volatility windows**: excursion is now computed for both `24h`
+  (last 2 of 14 price-history points plus current price) and `7d`; table
+  header widened from `VOL (%)` to `VOLAT (%)`.
+- **Token-price derivation**: a missing token leg USD price is derived from
+  the pool price and the known leg price.
+- **Meteora correctness fixes**: bogus position values no longer emitted,
+  `current_bin_id` fixed, fee sentinel corrected; active-bin RPC enrichment
+  is opt-in (only when `SOLANA_RPC_URL` is set).
+- **Wallet SOL pricing**: SOL price retries via a dedicated fetch when the
+  token-account price is missing; top-level `sol_price_usd` /
+  `wallet_total_usd` exposed.
+- Pending-fee sources are labeled (`raw_checkpoint` / `raw_per_bin_sum`);
+  Orca pool reward mints are fetched and priced.
+
 ## [Unreleased] - 2026-10-03
 
 ### Changed

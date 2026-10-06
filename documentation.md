@@ -4,13 +4,17 @@
 
 The project has three cooperating packages plus a shared core:
 
-- `screener_py` discovers, normalizes, scores, and emits pools as facts. Whitelist
-  and pre-scoring eligibility gates live in `missy_policy.json`. Sheldon owns
-  scoring *policy* and strategy; Missy owns the default score and feature vector.
+- `screener_py` discovers, normalizes, scores, and emits pools as facts. The
+  `missy_policy.json` eligibility gates decide `eligible`, and every candidate
+  carries the policy default score plus an experimental fee-capture score
+  (`new_fc_score`). Sheldon owns strategy policy and may recompute scores;
+  Missy owns discovery, the feature vector, and the default score.
 - `screener_position_py` discovers wallet LP positions, normalizes Helius
-  transactions, tracks closures, recomputes real Raydium CLMM pending
-  fees/rewards, enriches from the latest pool scan, and exposes conservative
-  position analytics.
+  transactions, tracks closures, recomputes live pending fees/rewards per
+  protocol (Raydium CLMM, Meteora DLMM, Orca Whirlpool), enriches from the
+  latest pool scan, attaches a versioned `position_features` block to every
+  position, and exposes conservative position analytics (including the
+  Concentrated Yield Capture scorer).
 - `wallet_screener` fetches SOL/SPL/Token-2022 balances, prices them via Jupiter
   Price API, and emits all assets sorted by USD value. Dust filtering is
   Sheldon's policy.
@@ -41,6 +45,7 @@ Missy-agent/
 |-- CHANGELOG.md
 |-- core/                               # Shared utilities
 |   |-- __init__.py
+|   |-- cache.py                      # DiskCache (per-key TTL, $MISSY_CACHE_DIR)
 |   |-- constants.py
 |   |-- display.py
 |   |-- helius.py
@@ -66,9 +71,9 @@ Missy-agent/
 |       |-- pair_class.py             # Pair cohort classification
 |       |-- filter_config.py            # FilterConfig + TIMEFRAME_WINDOWS (parsed, not policy)
 |       |-- pool_score_input.py         # Compatibility re-export from scoring
-|       |-- pool_scorer.py              # Compatibility re-export from scoring
+|       |-- pool_scorer.py              # PoolScorer: default score + score_fee_capture()
 |       |-- score_breakdown.py          # Compatibility re-export from scoring
-|       |-- scoring_config.py           # Compatibility re-export from scoring
+|       |-- scoring_config.py           # ScoringConfig (loads weights/anchors from policy)
 |       |-- token_config_parser.py      # symbol/mint/address/asset/value + aliases
 |       |-- token_set.py
 |       |-- whitelist.py
@@ -76,7 +81,7 @@ Missy-agent/
 |       |-- display.py
 |       |-- client.py                   # Compatibility re-export from clients/
 |       |-- config.py                   # Compatibility re-export (DEFAULT_CONFIG)
-|       |-- scoring.py                  # PoolScoreInput/PoolScorer/ScoreBreakdown (retained for Sheldon)
+|       |-- scoring.py                  # Compatibility re-exports (canonical: pool_score_input/pool_scorer/...)
 |       |-- screener.py                 # Compatibility re-export
 |       |-- normalize_utils.py          # Compatibility re-exports from core
 |       `-- clients/
@@ -102,14 +107,20 @@ Missy-agent/
 |       |-- position_scanner.py         # PositionScanner.scan(..., wallet_id, closure_state_path)
 |       |-- enrichment.py               # Pool-scan enrichment (value/range/fees/rewards)
 |       |-- raydium_pending.py          # Raydium CLMM SDK-port pending math + PDA derivation
+|       |-- meteora_pending.py          # Meteora DLMM per-bin fee/reward SDK port
+|       |-- orca_pending.py             # Orca Whirlpool growth-inside quote SDK port
+|       |-- position_features.py        # Versioned position_features block (FEATURES_VERSION)
 |       |-- test_raydium_pending.py
+|       |-- test_meteora_amounts.py
+|       |-- test_position_features.py
+|       |-- testdata/                   # Durable SDK ground-truth vectors (gen_vectors.cjs)
 |       |-- models.py
 |       |-- rpc.py
 |       |-- scanner.py
 |       |-- display.py
 |       |-- coercion.py                 # Compatibility re-exports from core.solana
 |       `-- analytics/
-|           |-- scoring.py
+|           |-- scoring.py              # PositionScorer + CYCPositionScorer
 |           |-- trader_scoring.py
 |           `-- closure_state.py
 `-- wallet_screener/
@@ -235,10 +246,19 @@ For each candidate Missy also emits:
 | `daily_turnover` | Window volume / effective TVL. |
 | `active_liquidity_factor` | Discount applied to concentrated liquidity pools. |
 
-Shetold may use the Missy default score directly or recompute its own score
+Sheldon may use the Missy default score directly or recompute its own score
 from the same feature vector for backtesting. Because rejected pools are still
 emitted, downstream consumers can decide whether to trust Missy's eligibility
 flag or apply their own gates during a transition period.
+
+### Fee-capture scoring (experimental)
+
+`PoolScorer.score_fee_capture(observation)` emits a second 0-100 model stored
+on `Candidate.new_fc_score` / `new_score_breakdown` (`new_score_model` tags the
+model identity). Weights: fee-yield 35 (log-scaled fee/TVL over a 0.05%-5%
+band), absolute-fee 25 ($200/day benchmark), liquidity-effectiveness 20
+(volatility centered at 15%), turnover-penalty 10 (erodes past 20x TVL/day),
+LP-share 10.
 | `fee_pct` | `float` | Fee tier percentage. |
 | `fee_rate` | `float` | Decimal fraction. Orca millionths are converted. |
 | `tick_spacing`, `bin_step` | `int` | One canonical concentrated-spacing value; `bin_step` is retained for compatibility. |
@@ -259,11 +279,12 @@ fetch_and_screen(max_pages: int = 5) -> tuple[list[Candidate], dict[str, int]]
 ```
 
 `screen_pool()` normalizes, enriches (Jupiter token prices, RPC active-bin /
-current-tick), derives daily fees and fee/TVL, and returns a `Candidate` fact
-with `score=0.0`, `effective_tvl=tvl`, and zeroed APR/score buckets. Only
-malformed payloads return `(None, reason)`; `screen_all()` records those as
-`invalid provider payload` rejections instead of losing the batch. Accepted
-candidates are sorted by descending score (currently all neutral).
+current-tick), derives daily fees and fee/TVL, runs the policy eligibility
+gates, scores with the default model (plus the experimental fee-capture
+model), and returns a `Candidate` fact. Only malformed payloads return
+`(None, reason)`; `screen_all()` records those as `invalid provider payload`
+rejections instead of losing the batch. Accepted candidates are sorted by
+descending score.
 `RaydiumScreener` and `MeteoraScreener` are compatibility aliases for
 `MultiDexScreener`, not provider-specific subclasses. On-chain tick decoding
 uses Meteora LbPair `activeId` at offset 76 (signed i32), Orca tick at offset
@@ -271,11 +292,16 @@ uses Meteora LbPair `activeId` at offset 76 (signed i32), Orca tick at offset
 
 ### Pool Scoring
 
-`PoolScoreInput` / `PoolScorer` / `ScoreBreakdown` / `ScoringConfig` are
-retained in `screener_py/scoring.py` for downstream (Sheldon) use. Missy does
-not call the scorer: emitted facts carry `score=0.0`,
-`realized_fee_apr=0.0`, `adjusted_apr=0.0`, and `0.0` for the yield/depth/
-efficiency/risk buckets, with `effective_tvl` equal to observed TVL.
+`PoolScoreInput` / `PoolScorer` / `ScoreBreakdown` / `ScoringConfig` live in
+their same-named modules (`screener_py/scoring.py` re-exports them for
+compatibility). Missy scores every candidate at screen time: the default
+model from `missy_policy.json` fills `score`, `score_breakdown`,
+`score_model`/`score_version`, `realized_fee_apr`, `adjusted_apr`,
+`effective_tvl`, `daily_turnover`, and `active_liquidity_factor`, and the
+experimental fee-capture model fills `new_fc_score` / `new_score_breakdown`.
+`ScoringConfig.from_policy()` builds weights/anchors from the policy with
+built-in defaults as fallback. Sheldon may reuse these inputs to recompute
+its own scores.
 
 ### Candidate and Display
 
@@ -393,6 +419,9 @@ automatic. The canonical implementation lives in `core.rpc`; the per-module
 
 ### Shared Core Helpers
 
+- `core.cache.DiskCache` — on-disk per-key TTL cache (default 300 s,
+  `$MISSY_CACHE_DIR` or `/tmp/missy-cache`) used by provider JSON fetches and
+  pending-fee RPC reads.
 - `core.http_client.HttpJsonClient` — standard-library JSON GET/POST with a 150 ms
   per-page pause.
 - `core.prices.JupiterPriceClient` — keyless Jupiter Price batch resolver
@@ -433,13 +462,14 @@ scan(
 The scanner validates a 32-byte base58 wallet and DEX selection. It concurrently
 fetches current Meteora, Raydium, and Orca state, chunks NFT-position RPC
 batches, optionally reconstructs Helius history, merges by
-`(dex, position_address)`, recomputes real Raydium CLMM pending fees/rewards
-from PoolState plus boundary tick arrays (stdlib SDK port in
-`raydium_pending.py`), enriches from the latest pool scan
-(`enrichment.py`: value, range, `fees_usd`/`rewards_usd`), tags every record
-with `wallet_id`, and returns sorted positions. Current state wins over
-historical state while retaining known open metadata. A failed provider's
-records are marked `status=unknown`.
+`(dex, position_address)`, recomputes live pending fees/rewards per protocol
+(`raydium_pending.py`, `meteora_pending.py`, `orca_pending.py` stdlib SDK
+ports, with per-pool RPC caching), enriches from the latest pool scan
+(`enrichment.py`: value, range, `fees_usd`/`rewards_usd`), attaches the
+versioned `position_features` block, tags every record with `wallet_id`, and
+returns sorted positions. Current state wins over historical state while
+retaining known open metadata. A failed provider's records are marked
+`status=unknown`.
 
 Source-specific failures are recorded in `PositionScan.errors`. History failure
 is non-fatal. If every selected current-state provider fails, `scan()` raises.
@@ -448,16 +478,47 @@ A provider returning no positions still counts as success.
 `attach_positions(candidates, positions)` mutates each candidate's
 `wallet_positions`, attaching non-closed records by exact `(dex, pool_address)`.
 
-### Raydium Pending Fees
+### Pending Fees (per-protocol SDK ports)
 
-`raydium_pending.PendingFeesFetcher(rpc)` fetches the live PoolState and both
-boundary tick arrays and applies the raydium-sdk-v2 `PositionUtils` math
-(fee/reward growth-inside with u128 wrap, unmasked BN sums). Helpers include
-`decode_pool_state`, `decode_tick`, `tick_array_address` (PDA derivation),
-`fee_growth_inside_values`, `pending_fees`, `reward_growth_inside_values`,
-`pending_rewards`, and `raydium_position_checkpoint`. This overwrites the stale
-checkpointed `token_fees_owed_*` / `reward_amount_owed_*` fields, which never
-update until a claim. Reward mints/decimals are recorded for USD pricing.
+All three ports are stdlib-only, verified against their SDKs on live mainnet
+accounts, and reached through `core/cache.py` `DiskCache` for per-pool RPC
+caching.
+
+- **Raydium** (`raydium_pending.PendingFeesFetcher(rpc)`): fetches the live
+  PoolState and both boundary tick arrays and applies the raydium-sdk-v2
+  `PositionUtils` math (fee/reward growth-inside with u128 wrap, unmasked BN
+  sums). Helpers include `decode_pool_state`, `decode_tick`,
+  `tick_array_address` (PDA derivation), `fee_growth_inside_values`,
+  `pending_fees`, `reward_growth_inside_values`, `pending_rewards`, and
+  `raydium_position_checkpoint`. This overwrites the stale checkpointed
+  `token_fees_owed_*` / `reward_amount_owed_*` fields, which never update
+  until a claim. Reward mints/decimals are recorded for USD pricing. Durable
+  SDK ground-truth vectors live in `testdata/` (`gen_vectors.cjs` regenerates
+  them).
+- **Meteora** (`meteora_pending`): ports the `@meteora-ag/dlmm` SDK per-bin
+  loop (`BinLiquidity.fromBin`, `mulShr`, `deriveBinArray`,
+  `binIdToBinArrayIndex`). Pending = share * (bin stored fee-per-liquidity
+  minus position checkpoint) >> 64 + settled residue; rewards follow the same
+  pattern against `rewardPerTokenStored`, with the active bin's accumulator
+  advanced to current time. Positions report live pending amounts plus real
+  token amounts instead of raw per-bin checkpoint sums.
+- **Orca** (`orca_pending`): ports the whirlpools-sdk `collectFeesQuote` /
+  `collectRewardsQuote` growth-inside quotes, replacing the stale
+  checkpointed `Position.feeOwedA/B` / `rewardInfos[].amountOwed` fields.
+
+### Position Features
+
+`position_features.build_position_features(position, pool)` attaches a
+versioned `position_features` block (`FEATURES_VERSION=1`) to every scanned
+position: identity (`dex`, `pool_address`, `position_address`, `wallet_id`,
+`status`), range geometry (`range_lower`/`range_upper`/`range_width`,
+`current_bin_id`, `in_range`, `edge_distance_frac`, `bins_to_lower/upper`,
+`single_sided`, `side_bias_x`), value and fees (`value_usd`, `fees_usd`,
+`rewards_usd`, `fees_apr_pct`, `days_open`), pool context (`pool_tvl_usd`,
+`pool_score*`, `pool_realized_fee_apr`, `pool_volatility_pct`,
+`pool_bin_step`, `pair_class`), and a `gaps` list naming every input that
+was missing. Features only — no score, no verdict. Bump
+`FEATURES_VERSION` whenever a key changes meaning.
 
 ### Position Records
 
@@ -519,6 +580,17 @@ historical prices are not available from the current scanner.
 history. `from_liquidity_position(position, pool_extra)` accepts normalized
 enrichment keys listed above.
 
+`CYCPositionScorer` (Concentrated Yield Capture) separates pool-level yield
+potential from position-level capture efficiency using only enrichment data
+already available from pool API scrapes — no new RPC calls. Components:
+`cyield_score` (fee APR adjusted by GBM-estimated in-range probability),
+`cdepth_score` (active TVL by pool-type liquidity factor), `cefficiency_score`
+(concentration factor x in-range probability), and `crisk_score` (volatility,
+concentration, boundary, and fee-tier penalties). `PositionScoreInput`
+carries the optional pool context (`pool_tvl_usd`, `pool_type`,
+`volatility_pct`, `fee_tier_pct`, `fees_apr_pct`); missing price data falls
+back to neutral values so existing callers are unaffected.
+
 ### Trader Scoring
 
 `TradePerformance` requires monetary fields in one quote currency.
@@ -566,6 +638,7 @@ distinct path.
 | `HELIUS_API_KEY` | Enable Helius RPC fallback and lifecycle history. |
 | `WALLET_PUBLIC_KEY` | Default wallet for `wallet_screener/main.py`. |
 | `JUPITER_PRICE_V2_URL` | Override Jupiter Price endpoint (default `https://api.jup.ag/price/v3`; v3 shapes parsed). |
+| `MISSY_CACHE_DIR` | Override the `DiskCache` directory (default `/tmp/missy-cache`). |
 | `WALLET_ID` | Cron-wrapper logical wallet tag consumed by `run_positions.sh` / `run_wallet.sh` (default `main`). |
 
 The project does not load `.env` itself. Set variables before the Python process

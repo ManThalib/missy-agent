@@ -2,10 +2,12 @@
 
 A standard-library Python suite for screening liquidity pools and monitoring wallet positions on Meteora DLMM, Raydium Standard/CLMM, and Orca Whirlpools. The project is split into three independent tools:
 
-1. **Pool Screener**: Discovers and normalizes pools using provider APIs.
-   Missy emits every normalized pool as a fact; whitelist, TVL/volume,
-   fee-tier, spacing, volatility, and APR policy lives in Sheldon.
-2. **Position Screener**: Analyzes active and historical LP positions for a given wallet using RPC.
+1. **Pool Screener**: Discovers, normalizes, and scores pools using provider
+   APIs. Missy enforces the `missy_policy.json` eligibility gates, emits a
+   default 0-100 score (plus an experimental fee-capture score) for every
+   candidate, and still emits failing pools with `eligible=false` so the
+   audit trail survives. Strategy policy lives in Sheldon.
+2. **Position Screener**: Analyzes active and historical LP positions for a given wallet using RPC, recomputes live pending fees/rewards per protocol, and attaches a versioned `position_features` block to every position.
 3. **Wallet Screener**: Fetches SOL, SPL, and Token-2022 balances, prices them in USD via Jupiter, and emits all assets sorted by USD value. Dust filtering is Sheldon's policy.
 
 The applications do not build, sign, or submit transactions. Pool discovery uses indexed public APIs and is appropriate for screening, not settlement.
@@ -16,10 +18,11 @@ The applications do not build, sign, or submit transactions. Pool discovery uses
 - Partial-provider failure isolation with warnings
 - Token symbol, mint, and alias parsing with paired-asset metadata
 - Normalized TVL, fee, volume, turnover, fee-tier, spacing, volatility, and APR observations
-- Neutral `score` placeholder (`0.0`); 0-100 scoring lives in Sheldon
+- Policy-driven eligibility gates plus a default 0-100 pool score (and an experimental fee-capture score); rejected pools are still emitted
 - Table or JSON output
 - Optional current and historical wallet LP-position discovery with `wallet_id` tagging
-- Raydium CLMM real pending fee/reward recomputation and pool-scan enrichment
+- Live pending fee/reward recomputation per protocol (Raydium CLMM, Meteora DLMM, Orca Whirlpool) plus pool-scan enrichment and a versioned position feature vector
+- On-disk TTL response cache shared by provider fetches and RPC reads
 - Helius Enhanced/Parsed/Raw transaction normalization
 - No third-party Python dependencies
 
@@ -62,11 +65,11 @@ documents would not form a valid JSON stream.
 Filter flags (`--min-tvl`, `--max-tvl`, `--min-fee-tvl`, `--min-daily-fee`,
 `--min-volume`, `--min-apr`, `--min-bin-step`/`--max-bin-step`,
 `--min-fee-pct`/`--max-fee-pct`, `--max-volatility`) are still parsed for CLI
-compatibility, but `MultiDexScreener.screen_pool()` no longer rejects pools:
-every normalized pool is emitted as a fact with a neutral `score` of `0.0`
-(`effective_tvl` equals `tvl`; `realized_fee_apr`/`adjusted_apr` and the four
-score buckets are `0.0`). Sheldon applies whitelist, band, and scoring policy
-downstream.
+compatibility. Eligibility is enforced from `missy_policy.json`
+(`pool_eligibility` gates); pools that fail are still emitted with
+`eligible=false` and a `rejected_reason`. Every candidate carries the policy
+default score (`score`, `score_breakdown`, `score_model`/`score_version`) plus
+the experimental fee-capture score (`new_fc_score`, `new_score_breakdown`).
 
 ## Environment
 
@@ -81,6 +84,7 @@ RAYDIUM_API_BASE=https://api-v3.raydium.io
 ORCA_API_BASE=https://api.orca.so/v2/solana
 METEORA_API_BASE=https://pool-discovery-api.datapi.meteora.ag
 JUPITER_PRICE_V2_URL=https://api.jup.ag/price/v3
+MISSY_CACHE_DIR=/tmp/missy-cache
 ```
 
 ```bash
@@ -177,13 +181,17 @@ The `$WALLET_PUBLIC_KEY` environment variable is also supported.
 Current positions are fetched from Solana RPC. If `HELIUS_API_KEY` is set,
 history is also reconstructed. `--position-history-pages 0` means unbounded
 pagination until Helius reports completion; a positive value bounds work and
-sets `history_complete` to false when more pages remain. Raydium CLMM active
-positions get real pending fees/rewards recomputed from PoolState plus boundary
-tick arrays (`raydium_pending.py`); a failed provider's positions are marked
+sets `history_complete` to false when more pages remain. Active positions get
+live pending fees/rewards recomputed per protocol — Raydium CLMM from PoolState
+plus boundary tick arrays (`raydium_pending.py`), Meteora DLMM from the per-bin
+fee/reward loop (`meteora_pending.py`), Orca Whirlpools from growth-inside
+quotes (`orca_pending.py`); a failed provider's positions are marked
 `status=unknown` instead of reading as out-of-range evidence. Positions are
 enriched from the latest `/data/missy-data/pool_screens/pool_scan-*.json`
 (current value, in-range flag, `fees_usd`/`rewards_usd`, token prices); one bad
-pool record never aborts the scan.
+pool record never aborts the scan. Every position also carries a versioned
+`position_features` block (range geometry, value/fees/rewards, pool context,
+`gaps` for missing inputs) for downstream scoring.
 
 Liquidity, tick/bin bounds, fees, and rewards are raw protocol values. They are
 not USD and are not added across token legs. Position score components that

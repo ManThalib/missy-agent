@@ -80,6 +80,9 @@ class Candidate:
     score_model: str = ""
     score_version: int = 0
     score_breakdown: Dict[str, float] = field(default_factory=dict)
+    new_score_model: str = "missy-default"
+    new_fc_score: float = 0.0
+    new_score_breakdown: Dict[str, float] = field(default_factory=dict)
     daily_turnover: float = 0.0
     active_liquidity_factor: float = 1.0
 
@@ -144,6 +147,9 @@ class Candidate:
             "score_model": self.score_model,
             "score_version": self.score_version,
             "score_breakdown": dict(self.score_breakdown),
+            "new_score_model": self.new_score_model,
+            "new_fc_score": self.new_fc_score,
+            "new_score_breakdown": dict(self.new_score_breakdown),
             "daily_turnover": self.daily_turnover,
             "active_liquidity_factor": self.active_liquidity_factor,
         }

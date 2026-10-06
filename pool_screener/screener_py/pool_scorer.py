@@ -1,7 +1,8 @@
+import math
 """Provider-neutral pool scoring implementation."""
 
 from math import isfinite, log1p
-from typing import Optional
+from typing import Dict, Optional
 
 from .pool_score_input import PoolScoreInput
 from .score_breakdown import ScoreBreakdown
@@ -117,3 +118,66 @@ class PoolScorer:
             daily_turnover=daily_turnover,
             active_liquidity_factor=active_factor,
         )
+
+    def score_fee_capture(self, observation: PoolScoreInput) -> Dict[str, float]:
+        """Fee‑capture‑centric scoring (0‑100) and sub‑components.
+
+        Weights (sum 100):
+        - Fee‑yield (35 %): log‑scaled fee‑per‑TVL ratio.
+        - Absolute fee (25 %): daily fee USD relative to a 200 USD benchmark.
+        - Liquidity effectiveness (20 %): penalty for volatility away from 15 %.
+        - Turnover penalty (10 %): reward for moderate turnover, cap at 20× TVL/day.
+        - LP‑share adjustment (10 %): proportion of fees that go to a single LP.
+        """
+        cfg = self.config
+        tvl = self._non_negative(observation.tvl_usd)
+        effective_factor = self._active_liquidity_factor(observation.pool_type)
+        effective_tvl = tvl * effective_factor
+        daily_fee_usd = self._non_negative(observation.fee_usd) * self._bounded(observation.lp_fee_share)
+        fee_tvl_ratio = (daily_fee_usd / tvl * 100.0) if tvl > 0.0 else 0.0
+        volatility = self._non_negative(observation.volatility_pct) if observation.volatility_pct is not None else 0.0
+        volume = self._non_negative(observation.volume_usd)
+        days = self._non_negative(observation.window_days) or 1.0
+        lp_share = self._bounded(observation.lp_fee_share)
+
+        daily_turnover = (volume / days) / effective_tvl if effective_tvl > 0.0 else 0.0
+
+        # 1) Fee‑yield score (35 %)
+        min_fee = 0.05   # policy minimum fee_tvl_ratio_pct
+        high_fee = 5.0    # high‑fee cap for normalisation
+        if fee_tvl_ratio <= min_fee:
+            fy_norm = 0.0
+        elif fee_tvl_ratio >= high_fee:
+            fy_norm = 1.0
+        else:
+            fy_norm = (math.log10(fee_tvl_ratio) - math.log10(min_fee)) / (math.log10(high_fee) - math.log10(min_fee))
+        fee_yield_score = fy_norm * 35.0
+
+        # 2) Absolute fee score (25 %)
+        abs_fee_norm = min(1.0, daily_fee_usd / 200.0)   # 200 USD/day benchmark
+        absolute_fee_score = abs_fee_norm * 25.0
+
+        # 3) Liquidity effectiveness (20 %)
+        # centre at 15 % volatility, width 70 % → penalty = |vol-15|/70
+        vol_penalty = abs(volatility - 15.0) / 70.0
+        liquidity_effectiveness = max(0.0, 1.0 - vol_penalty) * 20.0
+
+        # 4) Turnover penalty (10 %)
+        # turnover > 20× TVL/day starts to erode efficiency
+        turnover_penalty_norm = max(0.0, 1.0 - daily_turnover / 20.0)
+        turnover_penalty_score = turnover_penalty_norm * 10.0
+
+        # 5) LP‑share adjustment (10 %)
+        lp_share_adjustment = lp_share * 10.0
+
+        fc_score = fee_yield_score + absolute_fee_score + liquidity_effectiveness + turnover_penalty_score + lp_share_adjustment
+        fc_score = min(100.0, fc_score)
+
+        return {
+            "fc_score": fc_score,
+            "fee_yield_score": fee_yield_score,
+            "absolute_fee_score": absolute_fee_score,
+            "liquidity_effectiveness": liquidity_effectiveness,
+            "turnover_penalty_score": turnover_penalty_score,
+            "lp_share_adjustment": lp_share_adjustment,
+        }
