@@ -2,6 +2,22 @@
 
 All notable changes to the Missy-agent Multi-DEX Screener Suite are documented here.
 
+## [Unreleased] - 2026-10-07
+
+### Changed
+
+- **PnL-vs-HODL is now computed** (`analytics/scoring.py`): `_pnl_vs_hold`
+  applies the constant-product IL formula (`2*sqrt(Pt/P0)/(1+Pt/P0) - 1`,
+  entry price = range lower bound) instead of returning a permanent neutral
+  `0.5`. Score is `1 - |IL|` (1.0 = no IL); still neutral when price data
+  is missing or the lower bound is zero.
+- **Orca positions get live pending amounts** (`position_scanner.py`):
+  `_refresh_orca_pending` now runs every active Whirlpool position through
+  `OrcaPendingFeesFetcher.compute_pending()` (live pool state + boundary
+  tick arrays, SDK growth-inside math) and labels the source `computed`.
+  Failures keep the checkpointed values and record `pending_fees_error`
+  with a `raw_checkpoint` label instead of aborting the scan.
+
 ## [Unreleased] - 2026-10-06
 
 ### Added

@@ -505,6 +505,10 @@ caching.
 - **Orca** (`orca_pending`): ports the whirlpools-sdk `collectFeesQuote` /
   `collectRewardsQuote` growth-inside quotes, replacing the stale
   checkpointed `Position.feeOwedA/B` / `rewardInfos[].amountOwed` fields.
+  The scanner wires this per active Whirlpool position
+  (`OrcaPendingFeesFetcher.compute_pending()`), labels the source
+  `computed`, and falls back to `raw_checkpoint` with a recorded
+  `pending_fees_error` on failure.
 
 ### Position Features
 
@@ -573,8 +577,11 @@ normalized enrichment:
 Range and boundary components remain neutral without normalized price bounds.
 Fee yield remains neutral without both quote-valued position size and a
 timestamp-window fee delta. Raw fee legs are never summed into APR. PnL versus
-HODL remains neutral because deposits, withdrawals, token quantities, and
-historical prices are not available from the current scanner.
+HODL applies the constant-product IL formula (`2*sqrt(Pt/P0)/(1+Pt/P0) - 1`,
+entry price = range lower bound, score `1 - |IL|`) when current/lower/upper
+prices are present; it stays neutral when price data is missing or the lower
+bound is zero (true deposit/withdrawal history is still not available from
+the scanner).
 
 `PositionSnapshot` and `record_snapshot()` support bounded in-memory range
 history. `from_liquidity_position(position, pool_extra)` accepts normalized

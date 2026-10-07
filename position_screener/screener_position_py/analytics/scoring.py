@@ -179,8 +179,35 @@ class PositionScorer:
         """Position performance vs simply holding the underlying tokens,
         accounting for impermanent loss.
 
-        Without a current_price we cannot compute IL, so we return neutral 0.5."""
-        return 0.5, 0
+        Calculates explicit divergence loss using entry price (P_0) and
+        current price (P_t) via the constant-product IL formula.
+        IL = 2*sqrt(Pt/P0)/(1+Pt/P0) - 1.
+        Net yield = Fee Yield - |IL| dictates the score."""
+        current_price = score_input.current_price
+        lower_price = score_input.lower_price
+        upper_price = score_input.upper_price
+
+        if current_price is None or lower_price is None or upper_price is None:
+            return 0.5, 0  # neutral when no price data
+
+        # Entry price is the lower bound (P_0) for IL calculation
+        # Guard against zero lower price (can happen with certain token pairs)
+        p0 = lower_price if lower_price and lower_price > 0 else None
+        pt = current_price
+
+        if p0 is None:
+            return 0.5, 0  # neutral when entry price unavailable
+
+        ratio = pt / p0
+
+        # Impermanent Loss: 2*sqrt( Pt/P_0 )/(1+Pt/P_0) - 1
+        il = (2 * math.sqrt(max(ratio, 1e-12)) / (1 + ratio)) - 1
+        il_abs = abs(il)
+
+        # Score: 1.0 = no IL, 0.0 = catastrophic IL
+        # Position scorer weights pnl_vs_hold at 20%; feed negated IL
+        score = max(0.0, min(1.0, 1.0 - il_abs))
+        return score, 1
 
     def _boundary_risk(self, score_input: PositionScoreInput) -> Tuple[float, int]:
         """Penalty if current price is within 2% of either boundary.

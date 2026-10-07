@@ -25,6 +25,7 @@ from .analytics.closure_state import ClosureState
 from .enrichment import enrich_positions
 from .liquidity_position import LiquidityPosition
 from .meteora_pending import MeteoraPendingFeesFetcher
+from .orca_pending import OrcaPendingFeesFetcher
 from .position_scan import PositionScan
 from .raydium_pending import PendingFeesFetcher, raydium_position_checkpoint
 from .rpc_client import RpcClient
@@ -150,48 +151,57 @@ class PositionScanner:
             position.pending_fees_source = "computed"
 
     def _refresh_orca_pending(self, positions: List[LiquidityPosition]) -> None:
-        """Best-effort reward-mint population for Orca Whirlpool positions.
+        """Compute live pending fees/rewards for Orca Whirlpool positions.
 
-        Orca Position accounts already carry checkpointed feeOwedA/B, so we
-        keep those raw values and label the source. We do fetch the pool's
-        reward configuration so reward USD can be priced consistently with
-        Raydium positions.
+        Uses OrcaPendingFeesFetcher.compute_pending() to fetch live pool state
+        + boundary tick arrays and apply SDK math, so that pending amounts reflect
+        actual accrual rather than stale checkpointed values. Best-effort: a
+        failure keeps the checkpointed values and records the error.
         """
         active = [p for p in positions if p.dex == "orca" and p.status == "active"]
         if not active:
             return
-        pool_addresses = sorted({p.pool_address for p in active if p.pool_address})
-        pool_data: Dict[str, bytes] = {}
-        try:
-            for start in range(0, len(pool_addresses), _RPC_BATCH_SIZE):
-                batch = pool_addresses[start:start + _RPC_BATCH_SIZE]
-                results = self.rpc.batch(
-                    [("getAccountInfo", [a, {"encoding": "base64"}]) for a in batch]
-                )
-                for addr, res in zip(batch, results):
-                    value = (res or {}).get("value")
-                    data = value["data"][0] if value and isinstance(value.get("data"), list) else None
-                    if data:
-                        pool_data[addr] = base64.b64decode(data)
-        except Exception:
-            pass
 
-        reward_mints_by_pool: Dict[str, List[str]] = {}
-        for pool_address, data in pool_data.items():
-            try:
-                reward_mints_by_pool[pool_address] = self._decode_orca_pool_rewards(data)
-            except Exception:
-                reward_mints_by_pool[pool_address] = []
+        fetcher = OrcaPendingFeesFetcher(self.rpc)
 
         for position in active:
-            position.pending_fees_source = "raw_checkpoint"
-            if position.pool_enrichment is None:
-                position.pool_enrichment = {}
-            position.pool_enrichment["pending_fees_source"] = "raw_checkpoint"
-            mints = reward_mints_by_pool.get(position.pool_address, [])
-            if mints:
-                position.reward_mints = mints
-                position.reward_decimals = self._reward_decimals(mints)
+            try:
+                out = fetcher.compute_pending(
+                    position.pool_address,
+                    self._fetch_position_data(position.position_address),
+                    None,
+                )
+                position.fees_owed_raw = [int(v) for v in out["fees_owed_raw"]]
+                position.rewards_owed_raw = [int(v) for v in out["rewards_owed_raw"]]
+                position.reward_mints = [m if m else "" for m in out["reward_mints"]]
+                position.reward_decimals = self._reward_decimals(
+                    position.reward_mints
+                )
+                position.pending_fees_source = "computed"
+                if position.pool_enrichment is None:
+                    position.pool_enrichment = {}
+                position.pool_enrichment["pending_fees_source"] = "computed"
+            except Exception as exc:
+                # Keep checkpointed values on failure; label the error.
+                position.pending_fees_source = "raw_checkpoint"
+                if position.pool_enrichment is None:
+                    position.pool_enrichment = {}
+                position.pool_enrichment["pending_fees_error"] = str(exc)
+                position.pool_enrichment["pending_fees_source"] = "raw_checkpoint"
+
+    @staticmethod
+    def _fetch_position_data(position_address: str) -> bytes:
+        """Fetch the raw Position account bytes for a given address."""
+        from core.rpc import RpcClient
+        import base64
+
+        result = RpcClient().call(
+            "getAccountInfo", [position_address, {"encoding": "base64"}]
+        )
+        value = (result or {}).get("value")
+        if not value:
+            raise ValueError(f"Position account not found: {position_address}")
+        return base64.b64decode(value["data"][0])
 
     @staticmethod
     def _decode_orca_pool_rewards(data: bytes) -> List[str]:
