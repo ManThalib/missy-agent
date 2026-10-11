@@ -150,4 +150,7 @@ KNOWN_MINT_SYMBOLS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
     "So11111111111111111111111111111111111111112": "wSOL",
+    # Canonical Solana WBTC (Orca SOL-WBTC y-mint). Symbol-less tokens fall
+    # through Sheldon's dust classifier as "unknown"; keep major mints here.
+    "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh": "WBTC",
 }
