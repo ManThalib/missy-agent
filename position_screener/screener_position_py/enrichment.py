@@ -79,6 +79,72 @@ def _bin_to_price_ratio(bin_id: int, bin_step: int) -> float:
     return _safe_exp(bin_id * math.log(1.0 + bin_step / 10000.0))
 
 
+# Max tolerated divergence (bins) between a recorded active_bin_id and the
+# bin implied by the same pool record's own price. Real snapshots agree
+# within a few bins (price/activeId snapshot skew); the boundary matches
+# the scale-plausibility tolerance used downstream by Sheldon's range
+# guard, so enrichment repairs a record before the guard would.
+_ACTIVE_BIN_DRIFT_BINS = 200
+
+
+def _meteora_price_implied_bin(pool: Dict[str, Any], bin_step: int) -> Optional[int]:
+    """Active bin implied by the pool record's own price, or None.
+
+    current_price_ratio = (1 + bin_step/1e4)^active_bin and the oriented
+    pool_price is its reciprocal scaled by 10^(dec_y - dec_x), i.e.
+    pool_price_raw = current_price_ratio * 10^(dec_y - dec_x). Invert:
+        active_bin = log(pool_price_raw * 10^(dec_y - dec_x))
+                     / log(1 + bin_step/1e4)
+    """
+    if bin_step <= 0:
+        return None
+    raw = float(pool.get("pool_price_raw") or 0.0)
+    dec_x = int(pool.get("token_x_decimals") or 0)
+    dec_y = int(pool.get("token_y_decimals") or 0)
+    if raw <= 0 or dec_x <= 0 or dec_y <= 0:
+        return None
+    try:
+        ratio = raw * (10 ** (dec_y - dec_x))
+        if ratio <= 0:
+            return None
+        return int(round(math.log(ratio) / math.log(1.0 + bin_step / 10000.0)))
+    except (OverflowError, ValueError):
+        return None
+
+
+def _resolve_meteora_active_bin(
+    pool: Dict[str, Any], bin_step: int
+) -> tuple:
+    """Return (active_bin_or_None, source) for a Meteora pool record.
+
+    The pool scan ships active_bin_id=None when the discovery API omitted
+    it and both RPC fallbacks failed (scans 2026-10-11 23:43 and
+    2026-10-12 04:54 UTC+8): the field is unknown, not bin 0. Coercing it
+    to 0 while still trusting pool_price scaled bound prices by
+    (1+bin_step/1e4)^lower_bound (~228x on the 3potGhha pool). Recover
+    the bin from pool_price_raw in the same record; when a recorded bin
+    disagrees with that price beyond snapshot drift, trust the price so
+    current_price and the bounds stay on one scale.
+    """
+    recorded = pool.get("active_bin_id")
+    active_bin: Optional[int] = None
+    if recorded is not None and str(recorded) != "":
+        try:
+            active_bin = int(recorded)
+        except (TypeError, ValueError):
+            active_bin = None
+    implied = _meteora_price_implied_bin(pool, bin_step)
+    if implied is None:
+        return active_bin, "recorded"
+    if active_bin is None:
+        return implied, "derived_from_price_raw"
+    if abs(active_bin - implied) > _ACTIVE_BIN_DRIFT_BINS:
+        return implied, (
+            f"derived_from_price_raw_recorded_{active_bin}_implied_{implied}"
+        )
+    return active_bin, "recorded"
+
+
 def _clmm_amounts(liquidity_raw: int, current_tick: int, lower: int, upper: int) -> tuple:
     """Return (amount_x, amount_y) in raw units for a CLMM position."""
     if lower >= upper or liquidity_raw <= 0:
@@ -280,17 +346,18 @@ def _enrich_one(
         )
     elif position.dex == "meteora":
         bin_step = int(pool.get("bin_step") or pool.get("tick_spacing") or 0)
-        active_bin = int(pool.get("active_bin_id") or 0)
+        active_bin, active_bin_source = _resolve_meteora_active_bin(pool, bin_step)
         lower = position.lower_bound or 0
         upper = position.upper_bound or 0
         pool_price = float(pool.get("pool_price") or 0.0)
         if bin_step > 0:
-            if pool_price > 0:
+            log_bin = math.log(1.0 + bin_step / 10000.0)
+            if pool_price > 0 and active_bin is not None:
                 # Prefer the human pool price: it already carries the
-                # decimal adjustment, and recorded bin ids can be
-                # anomalous (a bad active_bin_id must not poison price
-                # math). Bound prices scale relative to the active bin.
-                log_bin = math.log(1.0 + bin_step / 10000.0)
+                # decimal adjustment, and the active bin has been resolved
+                # against the same record's price, so bounds stay on the
+                # price's scale. A missing recorded bin id never scales
+                # from bin 0.
                 position.current_price = pool_price
                 position.lower_price = _finite_or_zero(
                     pool_price * _safe_exp((lower - active_bin) * log_bin)
@@ -298,7 +365,10 @@ def _enrich_one(
                 position.upper_price = _finite_or_zero(
                     pool_price * _safe_exp((upper - active_bin) * log_bin)
                 )
-            else:
+            elif active_bin is not None:
+                # No human price: relative bin ratios only. The three
+                # fields share one scale, so ratios between them stay
+                # comparable.
                 position.current_price = _finite_or_zero(
                     _bin_to_price_ratio(active_bin, bin_step)
                 )
@@ -308,12 +378,23 @@ def _enrich_one(
                 position.upper_price = _finite_or_zero(
                     _bin_to_price_ratio(upper, bin_step)
                 )
+            else:
+                # No price and no recoverable bin: unknown, not fabricated.
+                position.current_price = 0.0
+                position.lower_price = 0.0
+                position.upper_price = 0.0
         else:
-            position.current_price = float(active_bin)
+            position.current_price = float(active_bin) if active_bin is not None else 0.0
             position.lower_price = float(lower)
             position.upper_price = float(upper)
-        position.current_bin_id = active_bin
-        position.in_range = lower <= active_bin <= upper
+        position.current_bin_id = active_bin if active_bin is not None else 0
+        position.in_range = (
+            active_bin is not None and lower <= active_bin <= upper
+        )
+        if active_bin_source != "recorded" and position.pool_enrichment is None:
+            position.pool_enrichment = {"active_bin_source": active_bin_source}
+        elif active_bin_source != "recorded":
+            position.pool_enrichment["active_bin_source"] = active_bin_source
 
     position.fees_usd = _compute_fees(position, pool)
     position.rewards_usd = _compute_rewards(
