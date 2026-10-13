@@ -74,6 +74,21 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(f["in_range"], False)
         self.assertEqual(f["bins_to_upper"], -60)
         self.assertAlmostEqual(f["edge_distance_frac"], 0.0)
+        self.assertEqual(f["oor_side"], "right")
+
+    def test_oor_side_left_inside_and_unknown(self):
+        self.assertEqual(
+            build_position_features(_pos(current_bin_id=90, in_range=False), POOL)["oor_side"],
+            "left")
+        self.assertEqual(
+            build_position_features(_pos(current_bin_id=100), POOL)["oor_side"],
+            "inside")
+        self.assertEqual(
+            build_position_features(_pos(current_bin_id=200), POOL)["oor_side"],
+            "inside")
+        self.assertEqual(
+            build_position_features(_pos(current_bin_id=None), POOL)["oor_side"],
+            "unknown")
 
     def test_unknown_amounts_value_gaps(self):
         pos = _pos(amounts_x_raw=None, amounts_y_raw=None, value_known=False,

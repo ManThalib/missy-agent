@@ -59,8 +59,17 @@ def build_position_features(
         bins_to_lower = current - lower
         bins_to_upper = upper - current
         edge_distance_frac = max(0.0, min(1.0, min(bins_to_lower, bins_to_upper) / (span / 2.0)))
+        # Which side of the range the live bin sits on. Boundary values count
+        # as inside. Unknown geometry is never reported as a side.
+        if current > upper:
+            oor_side = "right"
+        elif current < lower:
+            oor_side = "left"
+        else:
+            oor_side = "inside"
     else:
         bins_to_lower = bins_to_upper = edge_distance_frac = None
+        oor_side = "unknown"
         gaps.append("range_unknown")
 
     # --- Side composition (value-weighted) --------------------------------
@@ -130,6 +139,7 @@ def build_position_features(
         "status": getattr(position, "status", ""),
         "pair_class": (pool or {}).get("pair_class") or "unknown",
         "in_range": getattr(position, "in_range", None),
+        "oor_side": oor_side,
         "current_bin_id": current,
         "range_lower": lower,
         "range_upper": upper,
