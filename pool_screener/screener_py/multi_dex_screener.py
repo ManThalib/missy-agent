@@ -2,10 +2,11 @@
 
 import base64
 import math
+import random
 import time
 from collections import defaultdict
 from operator import attrgetter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .candidate import Candidate
 from .client import MeteoraClient, MultiDexClient, OrcaClient, RaydiumClient
@@ -23,6 +24,7 @@ from .scoring import PoolScoreInput, PoolScorer
 from .scoring_config import ScoringConfig
 from .whitelist import Whitelist, normalize_symbol
 from core.prices import JupiterPriceClient
+from core.rpc import RpcRateLimited
 
 
 __all__ = [
@@ -79,72 +81,79 @@ _ORCA_TICK_OFFSET = 81
 _RAYDIUM_TICK_OFFSET = 269
 
 
-def _decode_i32_at(account_data: bytes, offset: int) -> int:
+def _decode_i32_at(account_data: bytes, offset: int) -> Optional[int]:
+    """Decode a little-endian i32, or None when the payload is truncated.
+
+    None means "field unavailable"; 0 is a real decoded value.
+    """
     if len(account_data) < offset + 4:
-        return 0
+        return None
     return int.from_bytes(account_data[offset : offset + 4], "little", signed=True)
 
 
-def _decode_active_bin_id(account_data: bytes) -> int:
+def _decode_active_bin_id(account_data: bytes) -> Optional[int]:
     """Extract activeId (i32, little-endian) from a Meteora DLMM LbPair account.
 
     activeId is NOT the first field after the 8-byte discriminator; it sits
     at offset 76, after the 32-byte StaticParameters, 32-byte
     VariableParameters, bumpSeed, binStepSeed, and pairType fields.
+    Returns None when the payload is too short to contain activeId — bin 0
+    is a real on-chain value and must not be conflated with "unknown".
     """
-    end = _ACTIVE_ID_OFFSET + 4
-    if len(account_data) < end:
-        return 0
-    return int.from_bytes(
-        account_data[_ACTIVE_ID_OFFSET:end], "little", signed=True
-    )
+    return _decode_i32_at(account_data, _ACTIVE_ID_OFFSET)
 
 
-def _fetch_active_bin_id(rpc: Any, pool_address: str) -> int:
+def _fetch_active_bin_id(rpc: Any, pool_address: str) -> Optional[int]:
     """Fetch activeId from a Meteora DLMM LbPair account via RPC.
 
-    Returns 0 if the call fails or the field cannot be decoded.
+    Returns the decoded activeId (bin 0 is real), or None when the account
+    cannot be fetched or decoded. RpcRateLimited propagates so callers can
+    honor the server's Retry-After hint; other failures return None.
     """
     try:
         result = rpc.get_account_info(pool_address)
-        value = result.get("value") if isinstance(result, dict) else None
-        data = value.get("data") if isinstance(value, dict) else None
-        if isinstance(data, list) and data:
-            data = data[0]
-        if isinstance(data, str):
-            return _decode_active_bin_id(base64.b64decode(data))
-        if isinstance(data, bytes):
-            return _decode_active_bin_id(data)
-        return 0
+    except RpcRateLimited:
+        raise
     except Exception:
-        return 0
+        return None
+    value = result.get("value") if isinstance(result, dict) else None
+    data = value.get("data") if isinstance(value, dict) else None
+    if isinstance(data, list) and data:
+        data = data[0]
+    if isinstance(data, str):
+        return _decode_active_bin_id(base64.b64decode(data))
+    if isinstance(data, bytes):
+        return _decode_active_bin_id(data)
+    return None
 
 
-def _fetch_current_tick(rpc: Any, dex: str, pool_address: str) -> int:
+def _fetch_current_tick(rpc: Any, dex: str, pool_address: str) -> Optional[int]:
     """Fetch the live current tick via RPC for Orca whirlpools and Raydium CLMM.
 
     The discovery APIs do not expose tickCurrentIndex/tickCurrent, so the
-    pool account is read directly. Returns 0 when unavailable; callers must
-    treat 0 as unknown, not as a real tick.
+    pool account is read directly. Returns the decoded tick (0 is a real
+    value), or None when unavailable; RpcRateLimited propagates.
     """
     offset = {"orca": _ORCA_TICK_OFFSET, "raydium": _RAYDIUM_TICK_OFFSET}.get(
         (dex or "").lower()
     )
     if rpc is None or offset is None:
-        return 0
+        return None
     try:
         result = rpc.get_account_info(pool_address)
-        value = result.get("value") if isinstance(result, dict) else None
-        data = value.get("data") if isinstance(value, dict) else None
-        if isinstance(data, list) and data:
-            data = data[0]
-        if isinstance(data, str):
-            return _decode_i32_at(base64.b64decode(data), offset)
-        if isinstance(data, bytes):
-            return _decode_i32_at(data, offset)
-        return 0
+    except RpcRateLimited:
+        raise
     except Exception:
-        return 0
+        return None
+    value = result.get("value") if isinstance(result, dict) else None
+    data = value.get("data") if isinstance(value, dict) else None
+    if isinstance(data, list) and data:
+        data = data[0]
+    if isinstance(data, str):
+        return _decode_i32_at(base64.b64decode(data), offset)
+    if isinstance(data, bytes):
+        return _decode_i32_at(data, offset)
+    return None
 
 
 def _decode_tick_from_account(dex: str, data: Any) -> Optional[int]:
@@ -166,6 +175,53 @@ def _decode_tick_from_account(dex: str, data: Any) -> Optional[int]:
     return _decode_i32_at(raw, offset)
 
 
+# A 429 Retry-After hint is honored up to this cap so a pathological header
+# (or an HTTP-date misparse) cannot stall an hourly scan loop indefinitely;
+# beyond the cap the exponential backoff schedule takes over.
+_RETRY_AFTER_CAP_SECONDS = 30.0
+
+
+def _backoff_delay(
+    attempt: int, base_seconds: float, retry_after: Optional[float] = None
+) -> float:
+    """Exponential backoff with full jitter, honoring a 429 Retry-After hint.
+
+    The delay is at least the Retry-After hint (capped) and grows
+    exponentially with the attempt count; random jitter desynchronizes
+    concurrent scanners hammering the same rate-limit window.
+    """
+    delay = base_seconds * (2 ** attempt)
+    if retry_after and retry_after > 0:
+        delay = max(delay, min(float(retry_after), _RETRY_AFTER_CAP_SECONDS))
+    return delay + random.uniform(0.0, max(delay, 0.001) * 0.25)
+
+
+def _fetch_tick_with_retry(
+    fetch_fn: Callable[[], Optional[int]],
+    attempts: int = 3,
+    base_delay: float = 0.5,
+) -> Optional[int]:
+    """Run a tick/bin fetch callable with jittered backoff between failures.
+
+    Retries on RpcRateLimited (honoring its Retry-After hint) and on any
+    other transient failure. Returns the first non-None value, or None when
+    every attempt fails; None means "unknown" — 0 is a real value.
+    """
+    retry_after: Optional[float] = None
+    for attempt in range(attempts):
+        try:
+            value = fetch_fn()
+            if value is not None:
+                return value
+        except RpcRateLimited as exc:
+            retry_after = exc.retry_after
+        except Exception:
+            pass
+        if attempt < attempts - 1:
+            time.sleep(_backoff_delay(attempt, base_delay, retry_after))
+    return None
+
+
 def _batch_fetch_ticks(
     rpc: Any,
     requests: List[Tuple[str, str]],
@@ -176,15 +232,19 @@ def _batch_fetch_ticks(
     """Batch fetch current tick/bin for a list of (dex, pool_address) tuples.
 
     Returns a dict mapping pool_address -> tick/bin value (None if unknown).
-    Uses batched getAccountInfo RPC calls with retries on transient failures.
-    Defaults are tuned for Helius free-tier rate limits (small batches, longer
-    backoff between attempts).
+    Uses batched getAccountInfo RPC calls; a failed chunk stays pending while
+    the remaining chunks of the attempt still run. Retries with exponential
+    backoff; an HTTP 429 aborts the attempt early and the following sleep
+    honors the server's Retry-After hint (capped, jittered). Defaults are
+    tuned for Helius free-tier rate limits (small batches, longer backoff
+    between attempts).
     """
     if not rpc or not requests:
         return {}
 
     result: Dict[str, Optional[int]] = {}
     pending: List[Tuple[str, str]] = list(requests)
+    retry_after_hint: Optional[float] = None
 
     for attempt in range(retries + 1):
         if not pending:
@@ -196,54 +256,62 @@ def _batch_fetch_ticks(
         # Filter empty chunks.
         chunks = [c for c in chunks if c]
 
-        try:
-            for chunk in chunks:
-                payload = []
-                for local_idx, dex, addr in chunk:
-                    payload.append({
-                        "jsonrpc": "2.0",
-                        "id": local_idx + 1,
-                        "method": "getAccountInfo",
-                        "params": [addr, {"encoding": "base64"}],
-                    })
+        for chunk in chunks:
+            payload = []
+            for local_idx, dex, addr in chunk:
+                payload.append({
+                    "jsonrpc": "2.0",
+                    "id": local_idx + 1,
+                    "method": "getAccountInfo",
+                    "params": [addr, {"encoding": "base64"}],
+                })
+            try:
                 response = rpc._post(payload)
-                if not isinstance(response, list):
-                    response = [response]
-                # Map responses by local id to request order. Some providers return
-                # ids as strings, so coerce keys to int for robust matching.
-                by_id = {}
-                for item in response:
-                    if isinstance(item, dict):
-                        key = item.get("id")
-                        try:
-                            key = int(key)
-                        except (TypeError, ValueError):
-                            pass
-                        by_id[key] = item
-                for local_idx, dex, addr in chunk:
-                    item = by_id.get(local_idx + 1)
-                    if not item or item.get("error"):
-                        result.setdefault(addr, UNKNOWN_TICK)
-                        continue
-                    value = (item.get("result") or {}).get("value")
-                    if not isinstance(value, dict):
-                        result.setdefault(addr, UNKNOWN_TICK)
-                        continue
-                    tick = _decode_tick_from_account(dex, value.get("data"))
-                    # Keep first known value; do not overwrite known with unknown later.
-                    if addr not in result or result[addr] is UNKNOWN_TICK:
-                        result[addr] = tick
-                # Pause between chunks to respect provider rate limits.
-                time.sleep(0.25)
-        except Exception:
-            # On failure, leave entries pending for retry.
-            pass
+            except RpcRateLimited as exc:
+                # Provider is throttling: stop firing further chunks this
+                # attempt and let the backoff sleep honor Retry-After.
+                if exc.retry_after and exc.retry_after > 0:
+                    retry_after_hint = float(exc.retry_after)
+                break
+            except Exception:
+                # Transient failure: leave this chunk's entries pending for
+                # retry, keep processing the remaining chunks.
+                continue
+            if not isinstance(response, list):
+                response = [response]
+            # Map responses by local id to request order. Some providers return
+            # ids as strings, so coerce keys to int for robust matching.
+            by_id = {}
+            for item in response:
+                if isinstance(item, dict):
+                    key = item.get("id")
+                    try:
+                        key = int(key)
+                    except (TypeError, ValueError):
+                        pass
+                    by_id[key] = item
+            for local_idx, dex, addr in chunk:
+                item = by_id.get(local_idx + 1)
+                if not item or item.get("error"):
+                    result.setdefault(addr, UNKNOWN_TICK)
+                    continue
+                value = (item.get("result") or {}).get("value")
+                if not isinstance(value, dict):
+                    result.setdefault(addr, UNKNOWN_TICK)
+                    continue
+                tick = _decode_tick_from_account(dex, value.get("data"))
+                # Keep first known value; do not overwrite known with unknown later.
+                if addr not in result or result[addr] is UNKNOWN_TICK:
+                    result[addr] = tick
+            # Pause between chunks to respect provider rate limits.
+            time.sleep(0.25)
 
         # Anything we now know is no longer pending.
         pending = [(dex, addr) for (dex, addr) in pending if addr not in result or result[addr] is UNKNOWN_TICK]
 
         if pending and attempt < retries:
-            time.sleep(backoff_seconds * (2 ** attempt))
+            time.sleep(_backoff_delay(attempt, backoff_seconds, retry_after_hint))
+            retry_after_hint = None
 
     # Anything still pending after retries is unknown.
     for _, addr in pending:
@@ -666,18 +734,17 @@ class MultiDexScreener:
                     active_bin_id = prefetched
                     tick_source = "rpc_batched"
                 elif self.rpc:
-                    # Fallback single fetch after a short cooldown to recover
-                    # from any Helius rate-limiting that hit the batched phase.
-                    time.sleep(0.15)
-                    try:
-                        raw = _fetch_active_bin_id(self.rpc, pool_address)
-                        if raw == 0:
-                            active_bin_id = UNKNOWN_TICK
-                        else:
-                            active_bin_id = raw
-                            tick_source = "rpc_single"
-                    except Exception:
+                    # Fallback single fetch with jittered backoff so a
+                    # transient Helius 429 does not ship active_bin_id=None.
+                    raw = _fetch_tick_with_retry(
+                        lambda: _fetch_active_bin_id(self.rpc, pool_address)
+                    )
+                    if raw is None:
                         active_bin_id = UNKNOWN_TICK
+                    else:
+                        # 0 is a real on-chain bin, not a failure marker.
+                        active_bin_id = int(raw)
+                        tick_source = "rpc_single"
             # `current_tick_index` is a 1bp CLMM tick; a Meteora bin id is
             # not a tick. Keep it unknown here and expose a cross-DEX
             # comparable value via `current_tick_equivalent` below.
@@ -693,18 +760,17 @@ class MultiDexScreener:
                     current_tick_index = prefetched
                     tick_source = "rpc_batched"
                 elif self.rpc:
-                    # Fallback single fetch after a short cooldown to recover
-                    # from any Helius rate-limiting that hit the batched phase.
-                    time.sleep(0.15)
-                    try:
-                        raw = _fetch_current_tick(self.rpc, dex_name, pool_address)
-                        if raw == 0:
-                            current_tick_index = UNKNOWN_TICK
-                        else:
-                            current_tick_index = raw
-                            tick_source = "rpc_single"
-                    except Exception:
+                    # Fallback single fetch with jittered backoff so a
+                    # transient Helius 429 does not ship an unknown tick.
+                    raw = _fetch_tick_with_retry(
+                        lambda: _fetch_current_tick(self.rpc, dex_name, pool_address)
+                    )
+                    if raw is None:
                         current_tick_index = UNKNOWN_TICK
+                    else:
+                        # 0 is a real on-chain tick, not a failure marker.
+                        current_tick_index = int(raw)
+                        tick_source = "rpc_single"
 
         token_x_price_usd = float(n.get("token_x_price_usd") or 0.0)
         token_y_price_usd = float(n.get("token_y_price_usd") or 0.0)

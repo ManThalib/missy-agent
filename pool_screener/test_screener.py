@@ -6,10 +6,17 @@ import unittest
 from argparse import Namespace
 from dataclasses import asdict, replace
 from tempfile import NamedTemporaryFile
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from screener_py import multi_dex_screener
 from screener_py.client import MultiDexClient
-from screener_py.multi_dex_screener import _decode_active_bin_id, _decode_i32_at
+from screener_py.multi_dex_screener import (
+    _batch_fetch_ticks,
+    _decode_active_bin_id,
+    _decode_i32_at,
+    _fetch_tick_with_retry,
+)
+from core.rpc import RpcRateLimited
 from screener_py.pair_class import classify_pair
 from screener_py.policy_loader import DEFAULT_POLICY, PolicyError, load_policy
 from screener_py.scoring import PoolScoreInput, PoolScorer
@@ -263,9 +270,10 @@ class TestScreener(unittest.TestCase):
         data[76:80] = (-21154).to_bytes(4, "little", signed=True)
         self.assertEqual(_decode_active_bin_id(bytes(data)), -21154)
 
-    def test_meteora_active_bin_decode_short_buffer_returns_zero(self):
-        self.assertEqual(_decode_active_bin_id(b""), 0)
-        self.assertEqual(_decode_active_bin_id(bytes(range(79))), 0)
+    def test_meteora_active_bin_decode_short_buffer_returns_none(self):
+        # None means "field unavailable"; 0 must stay a real decoded bin.
+        self.assertIsNone(_decode_active_bin_id(b""))
+        self.assertIsNone(_decode_active_bin_id(bytes(range(79))))
 
     # ------------------------------------------------------------------
     # Orca/Raydium live-tick enrichment (ZEC/USDC center=0 re-open bug)
@@ -283,9 +291,9 @@ class TestScreener(unittest.TestCase):
         data[81:85] = (-21266).to_bytes(4, "little", signed=True)
         self.assertEqual(_decode_i32_at(bytes(data), 81), -21266)
 
-    def test_tick_decode_short_buffer_returns_zero(self):
-        self.assertEqual(_decode_i32_at(bytes(80), 81), 0)
-        self.assertEqual(_decode_i32_at(bytes(268), 269), 0)
+    def test_tick_decode_short_buffer_returns_none(self):
+        self.assertIsNone(_decode_i32_at(bytes(80), 81))
+        self.assertIsNone(_decode_i32_at(bytes(268), 269))
 
     @staticmethod
     def _orca_raw_pool():
@@ -642,6 +650,178 @@ class TestScreener(unittest.TestCase):
         candidates, _ = self.screener.screen_all([low, high])
         self.assertEqual(len(candidates), 2)
         self.assertGreaterEqual(candidates[0].score, candidates[1].score)
+
+
+class TickFallbackRetryTest(unittest.TestCase):
+    """Retry/backoff behavior for the RPC tick/bin fallbacks.
+
+    Regression: intermittent Helius 429s made both RPC fallbacks fail, so
+    Meteora DLMM records shipped active_bin_id=None (Oct 2026 scan logs).
+    """
+
+    METEORA_POOL_ADDRESS = "MeteoraPool111111111111111111111111111111"
+
+    def setUp(self):
+        # Keep backoff sleeps instant; capture them for assertions.
+        self.sleeps = []
+        sleep_patcher = patch.object(
+            multi_dex_screener.time, "sleep", side_effect=self.sleeps.append
+        )
+        sleep_patcher.start()
+        self.addCleanup(sleep_patcher.stop)
+
+        whitelist = Whitelist(
+            target_tokens=["JUP", "BONK"],
+            allowed_paired_tokens=["SOL", "USDC", SOL_MINT, USDC_MINT],
+        )
+        self.screener = RaydiumScreener(
+            whitelist=whitelist,
+            config=FilterConfig(
+                min_tvl=10000.0,
+                min_fee_tvl=0.05,
+                min_daily_fee=20.0,
+                max_volatility=20.0,
+            ),
+        )
+
+    @staticmethod
+    def _meteora_raw_pool():
+        return {
+            "_dex": "meteora",
+            "pool_address": TickFallbackRetryTest.METEORA_POOL_ADDRESS,
+            "token_x": {"symbol": "JUP", "address": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"},
+            "token_y": {"symbol": "SOL", "address": SOL_MINT},
+            "dlmm_params": {"bin_step": 4},
+            # Discovery API omitted activeId entirely (observed live).
+            "tvl": 1_000_000.0,
+            "volume": 100_000.0,
+            "fee": 1_000.0,
+            "apr": 50.0,
+            "fee_pct": 0.04,
+            "pool_price": 0.00833,
+            "min_price": 0.0082,
+            "max_price": 0.0085,
+            "volatility": 1.2,
+        }
+
+    @staticmethod
+    def _account_response(offset: int, value: int):
+        account = bytearray(max(offset + 4, 904))
+        account[offset : offset + 4] = int(value).to_bytes(4, "little", signed=True)
+        return {"value": {"data": [base64.b64encode(bytes(account)).decode(), "base64"]}}
+
+    @classmethod
+    def _rpc_rate_limited_then(cls, failures: int, offset: int, value: int):
+        rpc = Mock()
+        success = cls._account_response(offset, value)
+        rpc.get_account_info.side_effect = [RpcRateLimited("429")] * failures + [success]
+        return rpc
+
+    def test_single_fallback_recovers_from_rate_limit(self):
+        self.screener.rpc = self._rpc_rate_limited_then(2, 76, -5308)
+        candidate, _ = self.screener.screen_pool(self._meteora_raw_pool())
+        self.assertEqual(candidate.active_bin_id, -5308)
+        self.assertEqual(candidate.tick_source, "rpc_single")
+        # Two failures -> two backoff sleeps before the success.
+        self.assertEqual(len(self.sleeps), 2)
+
+    def test_single_fallback_bin_zero_is_real_not_unknown(self):
+        # activeId 0 is a legitimate on-chain bin, never a failure marker.
+        self.screener.rpc = self._rpc_rate_limited_then(0, 76, 0)
+        candidate, _ = self.screener.screen_pool(self._meteora_raw_pool())
+        self.assertEqual(candidate.active_bin_id, 0)
+        self.assertEqual(candidate.tick_source, "rpc_single")
+
+    def test_single_fallback_honors_retry_after_hint(self):
+        rpc = Mock()
+        rpc.get_account_info.side_effect = RpcRateLimited("429", retry_after=5.0)
+        self.screener.rpc = rpc
+        candidate, _ = self.screener.screen_pool(self._meteora_raw_pool())
+        # Every attempt failed -> unknown, but the waits respected the hint.
+        self.assertIsNone(candidate.active_bin_id)
+        self.assertEqual(candidate.tick_source, "none")
+        self.assertEqual(len(self.sleeps), 2)
+        self.assertGreaterEqual(self.sleeps[0], 5.0)
+        self.assertGreaterEqual(self.sleeps[1], 5.0)
+
+    def test_single_fallback_exhausted_retries_ship_unknown(self):
+        rpc = Mock()
+        rpc.get_account_info.side_effect = RuntimeError("connection reset")
+        self.screener.rpc = rpc
+        candidate, _ = self.screener.screen_pool(self._meteora_raw_pool())
+        self.assertIsNone(candidate.active_bin_id)
+
+    def test_fetch_tick_with_retry_returns_first_success(self):
+        calls = iter([None, None, 17])
+        value = _fetch_tick_with_retry(lambda: next(calls), attempts=3, base_delay=0.01)
+        self.assertEqual(value, 17)
+        self.assertEqual(len(self.sleeps), 2)
+
+    def test_batch_fetch_honors_retry_after_then_succeeds(self):
+        addr = self.METEORA_POOL_ADDRESS
+        rpc = Mock()
+        batch = [{
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": self._account_response(76, -5308),
+        }]
+        rpc._post.side_effect = [RpcRateLimited("429", retry_after=6.0), batch]
+        result = _batch_fetch_ticks(
+            rpc, [("meteora", addr)], retries=3, backoff_seconds=0.01, batch_size=20
+        )
+        self.assertEqual(result, {addr: -5308})
+        # The first (post-429) sleep honored Retry-After over the base backoff.
+        self.assertGreaterEqual(self.sleeps[0], 6.0)
+
+    def test_batch_fetch_marks_unknown_after_exhausted_retries(self):
+        addr = self.METEORA_POOL_ADDRESS
+        rpc = Mock()
+        rpc._post.side_effect = RuntimeError("connection reset")
+        result = _batch_fetch_ticks(
+            rpc, [("meteora", addr)], retries=2, backoff_seconds=0.01, batch_size=20
+        )
+        self.assertEqual(result, {addr: None})
+
+    def test_batch_fetch_chunk_failure_does_not_abort_other_chunks(self):
+        good = "OrcaPool111111111111111111111111111111111111"
+        bad = "MeteoraPool222222222222222222222222222222222222"
+        rpc = Mock()
+
+        def post(payload):
+            if payload[0]["params"][0] == bad:
+                raise RuntimeError("transient")
+            return [{
+                "jsonrpc": "2.0",
+                "id": payload[0]["id"],
+                "result": self._account_response(81, 26726),
+            }]
+
+        rpc._post.side_effect = post
+        result = _batch_fetch_ticks(
+            rpc,
+            [("meteora", bad), ("orca", good)],
+            retries=0,
+            backoff_seconds=0.01,
+            batch_size=1,
+        )
+        self.assertIsNone(result[bad])
+        self.assertEqual(result[good], 26726)
+
+    def test_backoff_delay_grows_and_jitters(self):
+        multi_dex_screener.random.seed(7)
+        delays = [
+            multi_dex_screener._backoff_delay(attempt, 1.0)
+            for attempt in range(4)
+        ]
+        # Monotonic baseline growth, never below the un-jittered base.
+        self.assertGreaterEqual(delays[0], 1.0)
+        self.assertLess(delays[0], delays[2])
+        self.assertLess(delays[2], delays[3])
+        # Retry-After overrides the exponential baseline (within the cap).
+        hinted = multi_dex_screener._backoff_delay(0, 1.0, retry_after=10.0)
+        self.assertGreaterEqual(hinted, 10.0)
+        capped = multi_dex_screener._backoff_delay(0, 0.1, retry_after=999.0)
+        self.assertLessEqual(capped, 30.0 * 1.25)
 
 
 if __name__ == "__main__":

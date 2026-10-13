@@ -3,7 +3,11 @@
 
 import os
 import sys
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -12,6 +16,7 @@ if _REPO_ROOT not in sys.path:
 from core.display import truncate
 from core.normalize import finite_number
 from core.prices import JupiterPriceClient
+from core.rpc import RpcClient, RpcRateLimited
 from core.solana import b58decode, b58encode, discriminator, is_valid_solana_address
 
 
@@ -74,6 +79,80 @@ class TestJupiterPriceClient(unittest.TestCase):
     def test_parse_prices_list_shape(self):
         data = {"data": [{"id": "mint-a", "price": "3.0"}]}
         self.assertEqual(JupiterPriceClient._parse_prices(data), {"mint-a": 3.0})
+
+
+class _StubRPCHandler(BaseHTTPRequestHandler):
+    """Reply per self.server.responses: list of (status, headers, body)."""
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        status, headers, body = self.server.responses.pop(0)
+        self.send_response(status)
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class TestRpcClient(unittest.TestCase):
+    def setUp(self):
+        # The loopback test server must bypass any ambient HTTP(S)_PROXY.
+        env_patcher = patch.dict(
+            os.environ,
+            {"no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost"},
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+    def _serve(self, responses):
+        server = HTTPServer(("127.0.0.1", 0), _StubRPCHandler)
+        server.responses = list(responses)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        # addCleanup is LIFO: shutdown first, then join, then close socket.
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}/"
+
+    def test_429_raises_rate_limited_with_retry_after(self):
+        url = self._serve([
+            (429, {"Retry-After": "7"}, b'{"error": "rate limited"}'),
+        ])
+        with self.assertRaises(RpcRateLimited) as ctx:
+            RpcClient(url).call("getAccountInfo", ["addr"])
+        self.assertEqual(ctx.exception.retry_after, 7.0)
+
+    def test_429_with_http_date_retry_after_is_parsed(self):
+        from email.utils import formatdate
+
+        url = self._serve([
+            (429, {"Retry-After": formatdate(time.time() + 60, usegmt=True)}, b"{}"),
+        ])
+        with self.assertRaises(RpcRateLimited) as ctx:
+            RpcClient(url).call("getAccountInfo", ["addr"])
+        self.assertIsNotNone(ctx.exception.retry_after)
+        self.assertGreater(ctx.exception.retry_after, 0)
+
+    def test_other_http_errors_stay_runtime_error(self):
+        url = self._serve([
+            (500, {}, b'{"error": "boom"}'),
+        ])
+        with self.assertRaises(RuntimeError) as ctx:
+            RpcClient(url).call("getAccountInfo", ["addr"])
+        self.assertNotIsInstance(ctx.exception, RpcRateLimited)
+
+    def test_success_returns_result(self):
+        url = self._serve([
+            (200, {}, b'{"jsonrpc": "2.0", "id": 1, "result": {"value": null}}'),
+        ])
+        result = RpcClient(url).get_account_info("addr")
+        self.assertEqual(result, {"value": None})
 
 
 if __name__ == "__main__":

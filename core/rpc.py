@@ -4,9 +4,39 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Iterable, List, Tuple
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+class RpcRateLimited(RuntimeError):
+    """The RPC endpoint answered HTTP 429 (rate limited).
+
+    Carries the server's Retry-After hint in seconds when the header is
+    present and parseable (plain seconds or an HTTP-date), else None.
+    Subclasses RuntimeError so existing broad handlers keep working.
+    """
+
+    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse a Retry-After header into delay seconds; None when absent/garbage."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:  # HTTP-date form
+        return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 class RpcClient:
@@ -37,6 +67,17 @@ class RpcClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # HTTPError is a URLError subclass; it must be matched first so
+            # 429 responses surface their Retry-After hint to retry loops.
+            if exc.code == 429:
+                raise RpcRateLimited(
+                    "RPC rate limited (HTTP 429)",
+                    retry_after=_parse_retry_after(
+                        exc.headers.get("Retry-After") if exc.headers else None
+                    ),
+                ) from exc
+            raise RuntimeError(f"RPC request failed: {exc}") from exc
         except (urllib.error.URLError, ValueError) as exc:
             raise RuntimeError(f"RPC request failed: {exc}") from exc
 
