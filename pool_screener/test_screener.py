@@ -15,6 +15,8 @@ from screener_py.multi_dex_screener import (
     _decode_active_bin_id,
     _decode_i32_at,
     _fetch_tick_with_retry,
+    _min_price_history_samples,
+    _price_history_volatility,
 )
 from core.rpc import RpcRateLimited
 from screener_py.pair_class import classify_pair
@@ -822,6 +824,104 @@ class TickFallbackRetryTest(unittest.TestCase):
         self.assertGreaterEqual(hinted, 10.0)
         capped = multi_dex_screener._backoff_delay(0, 0.1, retry_after=999.0)
         self.assertLessEqual(capped, 30.0 * 1.25)
+
+
+class TestOrcaPriceHistoryVolatility(unittest.TestCase):
+    """Day-window estimates from Orca's 12h-sampled priceHistory7d.
+
+    Regression class for the 2026-10-14 Czfq3xZZ incident: the old estimator
+    sliced the day window to 2 samples (a single 12h interval), read 0.137%
+    for SOL-USDC vs a 6.63% true day range, and Sheldon opened a 20-tick
+    range that reached its edge within 45 minutes.
+    """
+
+    @staticmethod
+    def _sol_like_series():
+        # Orca priceHistory7d shape: 14 points, 12h apart (values are
+        # Y-per-X; orientation is irrelevant for a range estimate).
+        return [
+            116.84, 116.23, 112.76, 108.93, 110.45, 109.26, 109.72,
+            109.89, 109.51, 111.32, 110.03, 103.87, 106.39,
+        ]
+
+    def test_day_window_spans_full_24h(self):
+        prices = self._sol_like_series()
+        current = 107.88
+        vol, available = _price_history_volatility(current, prices, "day")
+        self.assertTrue(available)
+        # Last 3 samples 110.03, 103.87, 106.39 + current -> 24h span.
+        window = prices[-3:] + [current]
+        expected = (max(window) - min(window)) / current * 100.0
+        self.assertAlmostEqual(vol, expected)
+        # The 24h span captures the 103.87 low the old 2-sample slice missed.
+        self.assertGreater(vol, 5.0)
+
+    def test_day_window_requires_three_samples(self):
+        vol, available = _price_history_volatility(107.88, [110.03, 103.87], "day")
+        self.assertFalse(available)
+        self.assertEqual(vol, 0.0)
+        self.assertGreaterEqual(_min_price_history_samples("day"), 3)
+
+    def test_day_window_exact_minimum(self):
+        vol, available = _price_history_volatility(1.0, [0.98, 1.03, 0.99], "day")
+        self.assertTrue(available)
+        self.assertAlmostEqual(vol, (1.03 - 0.98) / 1.0 * 100.0)
+
+    def test_week_window_uses_all_samples(self):
+        prices = [100.0, 104.0, 102.0]
+        vol, available = _price_history_volatility(103.0, prices, "week")
+        self.assertTrue(available)
+        self.assertAlmostEqual(vol, (104.0 - 100.0) / 103.0 * 100.0)
+
+    def test_week_window_requires_two_samples(self):
+        vol, available = _price_history_volatility(1.0, [1.0], "week")
+        self.assertFalse(available)
+        self.assertEqual(vol, 0.0)
+
+    def test_normalization_tags_insufficient_history(self):
+        pool = {
+            "_dex": "orca",
+            "address": "OrcaPool111111111111111111111111111111111",
+            "tickSpacing": 4,
+            "feeRate": 400,
+            "tvlUsdc": "50000",
+            "price": "1",
+            "priceHistory7d": ["0.98", "1.02"],
+            "tokenA": {
+                "symbol": "SOL",
+                "address": SOL_MINT,
+            },
+            "tokenB": {"symbol": "USDC", "address": USDC_MINT},
+            "stats": {
+                "24h": {"volume": "25000", "fees": "600", "yieldOverTvl": "0.012"}
+            },
+        }
+        normalized = normalize_pool(pool)
+        self.assertFalse(normalized["volatility_available"])
+        self.assertEqual(normalized["volatility_source"], "orca_price_history_insufficient")
+
+    def test_normalization_source_when_available(self):
+        pool = {
+            "_dex": "orca",
+            "address": "OrcaPool111111111111111111111111111111111",
+            "tickSpacing": 4,
+            "feeRate": 400,
+            "tvlUsdc": "50000",
+            "price": "1",
+            "priceHistory7d": ["0.98", "1.02", "1.01"],
+            "tokenA": {
+                "symbol": "SOL",
+                "address": SOL_MINT,
+            },
+            "tokenB": {"symbol": "USDC", "address": USDC_MINT},
+            "stats": {
+                "24h": {"volume": "25000", "fees": "600", "yieldOverTvl": "0.012"}
+            },
+        }
+        normalized = normalize_pool(pool)
+        self.assertTrue(normalized["volatility_available"])
+        self.assertEqual(normalized["volatility_source"], "orca_price_history_7d_day")
+        self.assertAlmostEqual(normalized["volatility"], (1.02 - 0.98) / 1.0 * 100.0)
 
 
 if __name__ == "__main__":

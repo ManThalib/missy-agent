@@ -348,20 +348,53 @@ def _range_volatility(price: float, price_min: float, price_max: float) -> Tuple
     return 0.0, False
 
 
+def _range_volatility(price: float, price_min: float, price_max: float) -> Tuple[float, bool]:
+    """Common range volatility = (max - min) / price * 100."""
+    if price > 0 and price_min > 0 and price_max > 0:
+        return (price_max - price_min) / price * 100.0, True
+    return 0.0, False
+
+
+# Orca's priceHistory7d is sampled every 12 hours (14 points over 7 days).
+_PRICE_HISTORY_SAMPLE_HOURS = 12
+# A day estimate must span the full last 24h: 3 samples (two 12h intervals)
+# plus the live price. Two samples span a single 12h interval and understate
+# a day range ~5x (2026-10-14 Czfq3xZZ incident: SOL-USDC read 0.137% vs a
+# 6.63% true day range, opening a 20-tick Whirlpool range).
+_MIN_DAY_HISTORY_SAMPLES = 3
+# Any range estimate needs at least two distinct points.
+_MIN_HISTORY_SAMPLES = 2
+
+
+def _min_price_history_samples(window: str) -> int:
+    """Minimum history samples required for a trustworthy window estimate."""
+    return _MIN_DAY_HISTORY_SAMPLES if window == "day" else _MIN_HISTORY_SAMPLES
+
+
 def _price_history_volatility(current_price: float, prices: List[float], window: str) -> Tuple[float, bool]:
-    """Range volatility from a list of historical prices."""
+    """Range volatility from Orca's 12h-sampled 7-day price history.
+
+    Same estimator semantics as _range_volatility — (max - min) / current
+    * 100 — over the samples covering the requested window:
+      day:   last 3 samples (two 12h intervals = 24h) + the live price.
+      week:  all samples (7d).
+      month: all samples (no 30d history exists; 7d is the best available).
+
+    Fail-closed: when the series is too short for the requested window,
+    return available=False instead of a silently narrow number. Callers
+    can distinguish this case via _min_price_history_samples(window).
+    """
     if current_price <= 0 or not prices:
         return 0.0, False
-    # Use the most recent N points per window.
-    window_points = {
-        "day": 2,  # ~24h if sampled every 12h
-        "week": len(prices),  # all available ~7d points
-        "month": len(prices),  # no 30d history available, fall back to all
-    }.get(window, len(prices))
-    window_points = min(window_points, len(prices))
-    window_prices = prices[-window_points:] + [current_price]
-    if not window_prices:
-        return 0.0, False
+    if window == "day":
+        if len(prices) < _MIN_DAY_HISTORY_SAMPLES:
+            return 0.0, False
+        window_prices = list(prices[-_MIN_DAY_HISTORY_SAMPLES:])
+    else:
+        if len(prices) < _MIN_HISTORY_SAMPLES:
+            return 0.0, False
+        window_prices = list(prices)
+    window_prices.append(current_price)
     return (max(window_prices) - min(window_prices)) / current_price * 100.0, True
 
 
@@ -465,6 +498,14 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day", price_map: Dict[st
         volatility, volatility_available = _price_history_volatility(
             current_price, prices, window
         )
+        if volatility_available:
+            volatility_source = f"orca_price_history_7d_{window}"
+        elif len(prices) < _min_price_history_samples(window):
+            # Too few history samples for the window; the estimate was
+            # withheld rather than narrowed (see _price_history_volatility).
+            volatility_source = "orca_price_history_insufficient"
+        else:
+            volatility_source = "orca_unavailable"
         orca_name = f"{token_a['symbol']}-{token_b['symbol']}"
         fee_rate = finite_float(pool.get("feeRate"), "fee rate") / 1_000_000.0
         tick_spacing = integer(pool.get("tickSpacing"), "tick spacing")
@@ -493,7 +534,7 @@ def normalize_pool(pool: Dict[str, Any], window: str = "day", price_map: Dict[st
             "volume": finite_float(stats.get("volume"), "volume"),
             "volatility": volatility,
             "volatility_available": volatility_available,
-            "volatility_source": f"orca_price_history_7d_{window}" if volatility_available else "orca_unavailable",
+            "volatility_source": volatility_source,
             "volatility_window": window,
             "apr": apr,
             "apr_source": apr_source,
