@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -12,6 +14,77 @@ from .cache import DiskCache
 
 PAGE_DELAY_SECONDS = 0.15
 _DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; PoolScreener/1.0)"
+
+
+def _create_connection_ipv4(
+    address, timeout: Optional[float] = None, source_address=None
+):
+    """Connect over IPv4 only.
+
+    The screener host has a default IPv6 route that blackholes outbound
+    traffic. urllib tries every AAAA address first, waiting the full socket
+    timeout on each, so a single discovery request can stall for 30s and the
+    hourly pipeline gets killed before it prints JSON. curl succeeds because
+    it falls back to IPv4 immediately.
+    """
+    host, port = address
+    last_error: Optional[OSError] = None
+    for family, socktype, proto, _canonname, sockaddr in socket.getaddrinfo(
+        host, port, socket.AF_INET, socket.SOCK_STREAM
+    ):
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            if timeout is not None:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"getaddrinfo returned no IPv4 addresses for {host}")
+
+
+class _IPv4HTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        self.sock = _create_connection_ipv4(
+            (self.host, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _IPv4HTTPSConnection(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        self.sock = _create_connection_ipv4(
+            (self.host, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=server_hostname
+        )
+
+
+class _IPv4HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_IPv4HTTPConnection, req)
+
+
+class _IPv4HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(
+            _IPv4HTTPSConnection,
+            req,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
 
 
 class HttpJsonClient:
@@ -25,6 +98,9 @@ class HttpJsonClient:
         self.base_url = base_url
         self.timeout = timeout
         self.cache: Optional[DiskCache] = None
+        self._opener = urllib.request.build_opener(
+            _IPv4HTTPHandler(), _IPv4HTTPSHandler()
+        )
 
     def _cache_key(self, url: str) -> str:
         return url
@@ -44,7 +120,7 @@ class HttpJsonClient:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=self.timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, ValueError) as exc:
             raise RuntimeError(f"GET {url[:120]} failed: {exc}") from exc

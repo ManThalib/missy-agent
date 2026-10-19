@@ -246,9 +246,17 @@ class PositionScanner:
             position.pool_enrichment["pending_fees_source"] = "raw_per_bin_sum"
         if not active:
             return
-        raw_accounts = self._fetch_meteora_position_accounts(
-            [p.position_address for p in active if p.position_address]
-        )
+        try:
+            raw_accounts = self._fetch_meteora_position_accounts(
+                [p.position_address for p in active if p.position_address]
+            )
+        except Exception as exc:
+            # Best-effort enrichment: an RPC failure here must not abort the
+            # whole scan. Keep raw checkpointed sums and record the error so
+            # downstream enrichment reports value_known=false.
+            for position in active:
+                position.pool_enrichment["meteora_pending_error"] = str(exc)
+            return
         for position in active:
             data = raw_accounts.get(position.position_address)
             if data is None:

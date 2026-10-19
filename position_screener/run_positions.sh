@@ -3,27 +3,40 @@
 # Scans active Orca LP positions from the executor wallet via Solana RPC,
 # writes timestamped JSON output.
 set -u
-REPO=/data/missy-agent/position_screener
-OUTDIR=/data/missy-data/position_scans
-LOG=/data/missy-data/position_scans/cron.log
+# Resolve the screener directory from this script so the wrapper works from
+# the workspace clone (/data/missy-agent does not exist on this host).
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTDIR="${POSITION_SCAN_DIR:-/data/missy-data/position_scans}"
+LOG="${POSITION_SCAN_LOG:-$OUTDIR/cron.log}"
+mkdir -p "$OUTDIR"
 # Use Asia/Shanghai (UTC+8) for all timestamps and filenames.
 export TZ=Asia/Shanghai
+# Schedulers that do not inject the OpenClaw secret store (command payloads,
+# plain cron) read the public wallet from this file instead.
+PIPELINE_ENV_FILE="${PIPELINE_ENV_FILE:-/data/missy-data/pipeline.env}"
+if [ -z "${SOLANA_PUBLIC_WALLET:-}" ] && [ -r "$PIPELINE_ENV_FILE" ]; then
+  . "$PIPELINE_ENV_FILE"
+fi
 WALLET="${SOLANA_PUBLIC_WALLET:?SOLANA_PUBLIC_WALLET is required}"
 # wallet_id tags every scan/position record for the multi-wallet mirror.
 # MAIN is the policy wallet (Sheldon sizes from it); mirror wallets scan
 # with WALLET_ID=main overridden. Default: main.
 WALLET_ID="${WALLET_ID:-main}"
-# RPC credentials come from the injected environment (OpenClaw secrets store):
-# SOLANA_RPC_URL must be the full Helius endpoint including its api-key parameter.
-export SOLANA_RPC_URL="${SOLANA_RPC_URL:?SOLANA_RPC_URL is required (inject from secrets store)}"
-if [ -z "${HELIUS_API_KEY:-}" ]; then
+# RPC credentials come from the injected environment (OpenClaw secrets store)
+# when available. Fall back to the public endpoint so the hourly pipeline can
+# still produce a scan; Raydium/Orca inventory lookups may be rate limited.
+if [ -z "${SOLANA_RPC_URL:-}" ]; then
+  echo "[$(date +%FT%T%z)] WARN: SOLANA_RPC_URL not set; using public mainnet RPC" >> "$LOG"
+  SOLANA_RPC_URL="https://api.mainnet-beta.solana.com"
+fi
+export SOLANA_RPC_URL
+if [ -z "${HELIUS_API_KEY:-}" ] && [[ "${SOLANA_RPC_URL}" == *"api-key="* ]]; then
   # Derive the key from the injected URL so SOLANA_RPC_URL is the single source.
   HELIUS_API_KEY=${SOLANA_RPC_URL##*api-key=}
   HELIUS_API_KEY=${HELIUS_API_KEY%%[!A-Za-z0-9_-]*}
 fi
 export HELIUS_API_KEY
 : "${HELIUS_API_KEY:-}" >/dev/null || true  # empty key only disables history scan
-mkdir -p "$OUTDIR"
 TS=$(date +%Y%m%d-%H%M%S)
 OUT="$OUTDIR/position_scan-$TS.json"
 cd "$REPO" || exit 1
