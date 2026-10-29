@@ -12,6 +12,8 @@
 ## Scope
 
 - `pool_screener/pool_screener.py`, `position_screener/position_screener.py`, and `wallet_screener/main.py` are the CLI entrypoints. Shared logic lives in the top-level `core/` package; `pool_screener/screener_py/` and `position_screener/screener_position_py/` own provider-specific logic, and `wallet_screener/` keeps one class per file.
+- Pool features v1 (`pool_screener/screener_py/pool_features.py`) is the safety-gate + fee-capture contract: `safety_score`/`opportunity_score`, `safety`, `data_quality`, `fee_capture`, `expected_in_range_frac`, `il_estimate_pct`, `slippage_estimate_bps`, P2 rug signals. It is pure (clock injected), additive, and documented in `docs/pool_features_v1*`. Never gate on `opportunity_score`; never remove or rename legacy fields.
+- Admission floors and feature tunables live in `pool_screener/missy_policy.json` (`version: 2`). Lowering a floor must never require a code change; a floor of `0` disables that gate.
 - The default `--dex all` queries Meteora DLMM, Raydium Standard/CLMM, and Orca Whirlpools. Keep provider payload conversion in `normalize_pool()` (`pool_screener/screener_py/normalizers.py`) so filtering remains provider-independent. Live tick/bin lookups live in `tick_fetch.py`, and gating/scoring stays in `multi_dex_screener.py`.
 - Missy emits facts plus a default score; Sheldon owns strategy policy. `MultiDexScreener.screen_pool()` enforces the `missy_policy.json` eligibility gates but still emits failing pools with `eligible=false` and `rejected_reason`, and scores every candidate with the policy default model (plus the experimental fee-capture model on `new_fc_score`). `WalletScanner.scan()` emits all assets (no dust filtering). Keep the `threshold_usd` compat plumbing intact.
 - This project uses only the Python standard library. Do not introduce a dependency or requirements file for ordinary HTTP/CLI work.
@@ -22,12 +24,13 @@
 - Focus one provider while debugging: `python3 pool_screener.py --dex meteora|raydium|orca --pages 1 --page-size 25`.
 - Run all tests (each from its own directory, core from the repo root):
   ```bash
-  cd pool_screener && python3 -m unittest test_screener
+  cd pool_screener && python3 -m unittest test_screener test_pool_features
   cd ../position_screener && python3 -m unittest test_positions
   cd ../wallet_screener && python3 -m unittest test_wallet_screener
   cd .. && python3 -m unittest core.test_core
   ```
 - Run one test: `python3 -m unittest test_screener.TestScreener.test_orca_pool_normalization`.
+- Eligibility diff after a policy change (from `pool_screener/`): `python3 tools/diff_eligibility.py --raw tests/fixtures/provider_pools_2026-10-29.json --prices-from tests/fixtures/pool_scan_2026-10-29.json`.
 - Verify argument wiring after CLI edits: `python3 pool_screener.py --help`, `python3 position_screener.py --help`, or `python3 main.py --help` (wallet; `python3 -m wallet_screener.main --help` from the repo root).
 
 ## Provider Details

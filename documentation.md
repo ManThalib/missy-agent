@@ -43,6 +43,10 @@ Missy-agent/
 |-- documentation.md
 |-- AGENTS.md
 |-- CHANGELOG.md
+|-- docs/                               # Contracts and schema references
+|   |-- pool_features_v1_design.md      # Design + formulas + open-question decisions
+|   |-- pool_features_v1.md             # Field-by-field schema, reject taxonomy, versioning
+|   `-- missy_sheldon_contract_v1.md    # One-page producer -> consumer handoff
 |-- core/                               # Shared utilities
 |   |-- __init__.py
 |   |-- cache.py                      # DiskCache (per-key TTL, $MISSY_CACHE_DIR)
@@ -61,8 +65,12 @@ Missy-agent/
 |   |-- pool_screener.py                # Pool CLI entrypoint
 |   |-- run_meteora.sh                # Cron wrapper: --dex all --json --pages 1
 |   |-- tokens.json                     # Token metadata (asset/mint/aliases)
-|   |-- missy_policy.json               # Missy eligibility + default scoring model
+|   |-- missy_policy.json               # Missy eligibility floors + scoring/feature models
 |   |-- test_screener.py
+|   |-- test_pool_features.py           # v1 contract: schema, determinism, monotonicity, floors
+|   |-- tools/
+|   |   `-- diff_eligibility.py         # legacy / v1-old-floors / v1-active-policy diff
+|   |-- tests/fixtures/                 # Raw provider payloads + one real scan (frozen clock)
 |   `-- screener_py/                    # Public pool facade and logic
 |       |-- __init__.py
 |       |-- constants.py                # Compatibility re-exports from core
@@ -73,6 +81,7 @@ Missy-agent/
 |       |-- filter_config.py            # FilterConfig + TIMEFRAME_WINDOWS (parsed, not policy)
 |       |-- pool_score_input.py         # Compatibility re-export from scoring
 |       |-- pool_scorer.py              # PoolScorer: default score + score_fee_capture()
+|       |-- pool_features.py            # v1 contract: safety/opportunity + net-yield inputs
 |       |-- score_breakdown.py          # Compatibility re-export from scoring
 |       |-- scoring_config.py           # ScoringConfig (loads weights/anchors from policy)
 |       |-- token_config_parser.py      # symbol/mint/address/asset/value + aliases
@@ -262,6 +271,47 @@ model identity). Weights: fee-yield 35 (log-scaled fee/TVL over a 0.05%-5%
 band), absolute-fee 25 ($200/day benchmark), liquidity-effectiveness 20
 (volatility centered at 15%), turnover-penalty 10 (erodes past 20x TVL/day),
 LP-share 10.
+
+This model is informational. It is **not** the v1 `opportunity_score` below,
+and it is not net-yield aware.
+
+### Pool features v1 (safety gate + fee-capture inputs)
+
+`pool_features.py` is the per-pool contract added in v1. It is pure: the
+screener passes already-normalized values plus an injected clock, so the same
+input always produces the same record. Full schema in
+`docs/pool_features_v1.md`; formulas and rationale in
+`docs/pool_features_v1_design.md`; the consumer summary in
+`docs/missy_sheldon_contract_v1.md`.
+
+| Field | Meaning |
+|---|---|
+| `pool_features_version` | Schema version (`1`); absent on a record means v0. |
+| `as_of` / `scan_age_seconds` | Scan-start ISO timestamp (Asia/Shanghai) and data age. |
+| `safety_score` | 0-100: log TVL, stable-peg, data completeness, pool age. No fee terms. |
+| `opportunity_score` | 0-100: `log1p(realized_fee_apr)/log1p(300)`. No depth, no net yield. |
+| `safety` | `eligible`, `reject_codes`, `metrics`, `thresholds_used`. |
+| `data_quality` | `complete`, `missing`, `range_ready`, `prices_known`, `missing_optional`. |
+| `fee_capture` | `realized_fee_apr`, `volume_window`, `tvl`, `fee_tvl_ratio`, `fee_tier`, `bin_step`, `tick_spacing`. |
+| `expected_in_range_frac` | Brownian barrier survival over the deployable reference band, with `reference_half_width_pct/_units/width_source`, `vol_daily_pct`, `sigma_daily_pct`, and a 1/3/7-day `curve`. |
+| `il_estimate_pct` | Divergence loss at the band edge (positive = loss). |
+| `slippage_estimate_bps` | `{"100": n, "1000": n}` plus `slippage_model.depth_proxy_usd` for any size. |
+| `pool_age_days`, `lp_lock`, `tvl_trend_24h_pct`, `owner_concentration_pct` | P2 rug/liquidity-pull signals; `null` when the provider cannot supply them (`owner_concentration_pct` is always null in v1). |
+| `pair_confidence` | 0-1 identity confidence in `pair_class`. |
+
+The reference band mirrors Sheldon's `adaptive_half_width()` (0.5x daily
+volatility held to a 1% price-fraction floor, 10-unit minimum, 34 Meteora bins
+/ 1000 raw ticks cap). Missy keeps its own copy of those constants because the
+repos are separate; `test_pool_features.py` pins them.
+
+Reject codes: `blacklisted`, `missing_data`, `bin_step_invalid`, `low_tvl`,
+`low_volume`, `low_fee_tvl`, `high_vol`, `high_turnover`, `bad_peg`, `stale`,
+`unknown_pair` (fixed precedence). A policy floor of `0` disables that gate.
+
+Normalization notes: Meteora `tvl_change_pct` is a ratio to the prior window
+(100 = flat) so it is emitted as `raw - 100`; Orca `lockedPercentage` is a
+fraction (x100); Raydium `burnPercent` is already a percent and means *burned*,
+not locked. Out-of-range values become `null`, never clamped.
 | `fee_pct` | `float` | Fee tier percentage. |
 | `fee_rate` | `float` | Decimal fraction. Orca millionths are converted. |
 | `tick_spacing`, `bin_step` | `int` | One canonical concentrated-spacing value; `bin_step` is retained for compatibility. |
@@ -284,10 +334,12 @@ fetch_and_screen(max_pages: int = 5) -> tuple[list[Candidate], dict[str, int]]
 `screen_pool()` normalizes, enriches (Jupiter token prices, RPC active-bin /
 current-tick), derives daily fees and fee/TVL, runs the policy eligibility
 gates, scores with the default model (plus the experimental fee-capture
-model), and returns a `Candidate` fact. Only malformed payloads return
-`(None, reason)`; `screen_all()` records those as `invalid provider payload`
-rejections instead of losing the batch. Accepted candidates are sorted by
-descending score.
+model), attaches the pool-features v1 block, and returns a `Candidate` fact.
+Only malformed payloads return `(None, reason)`; `screen_all()` records those
+as `invalid provider payload` rejections instead of losing the batch. Accepted
+candidates are sorted by descending legacy `score` (unchanged; the v1 scores
+are emitted for consumers that want to rank differently). `clock=` may be
+injected for deterministic tests; it defaults to `time.time`.
 `RaydiumScreener` and `MeteoraScreener` are compatibility aliases for
 `MultiDexScreener`, not provider-specific subclasses. On-chain tick decoding
 uses Meteora LbPair `activeId` at offset 76 (signed i32), Orca tick at offset

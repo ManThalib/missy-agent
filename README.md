@@ -63,11 +63,22 @@ Meteora warning. A Meteora-only CLI scan rejects those incompatible windows.
 documents would not form a valid JSON stream.
 
 Eligibility is enforced only from `missy_policy.json` (`pool_eligibility`
-gates). Pools that fail are still emitted with `eligible=false` and a
-`rejected_reason`, and the table lists them separately from qualified pools.
+gates). Pools that fail are still emitted with `eligible=false`, a structured
+`safety.reject_codes` list and a `rejected_reason`, and the table lists them
+separately from qualified pools.
 Every candidate carries the policy default score (`score`, `score_breakdown`,
 `score_model`/`score_version`) plus the experimental fee-capture score
 (`new_fc_score`, `new_score_breakdown`), which uses daily fees.
+
+On top of that, every pool carries the **pool features v1** block
+(`pool_features_version: 1`): `safety_score`/`opportunity_score`, a `safety`
+gate block with `reject_codes` and the exact `thresholds_used`, `data_quality`,
+`fee_capture`, `expected_in_range_frac`, `il_estimate_pct`,
+`slippage_estimate_bps`, `pair_confidence` and the P2 rug/liquidity-pull
+signals (`pool_age_days`, `lp_lock`, `tvl_trend_24h_pct`,
+`owner_concentration_pct`). It is additive: legacy fields are unchanged.
+See `docs/pool_features_v1.md` (schema), `docs/pool_features_v1_design.md`
+(formulas) and `docs/missy_sheldon_contract_v1.md` (consumer guide).
 
 Threshold flags are parsed for compatibility but not enforced:
 `--min-fee-tvl`, `--min-daily-fee`, `--min-apr`, `--max-volatility`,

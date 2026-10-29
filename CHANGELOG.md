@@ -2,6 +2,108 @@
 
 All notable changes to the Missy-agent Multi-DEX Screener Suite are documented here.
 
+## [1.1.0] - 2026-10-29 - Pool features v1 (safety gate + fee-capture contract)
+
+Baseline: commit `4e68494`. All suites green: pool_screener 121, position_screener 91,
+wallet_screener 16, core 45 (41 new tests in `pool_screener/test_pool_features.py`).
+Design: `docs/pool_features_v1_design.md`. Schema: `docs/pool_features_v1.md`.
+Handoff one-pager: `docs/missy_sheldon_contract_v1.md`.
+
+Splits Missy's single opaque `score` into a **safety gate** (Missy's job) and **fee-capture / net-yield
+inputs** (Sheldon's ranking job), so Sheldon can stop gating on an opportunity score. Every existing
+field is untouched: `score`, `eligible`, `rejected_reason`, `score_breakdown`, `pair_class` and all
+provider fields keep their names, types and meaning.
+
+### Added
+
+- `safety_score` (liquidity + peg + data quality + pool age, **no fee terms**) and
+  `opportunity_score` (gross fee yield only, **no depth**, strictly monotone in APR).
+- `safety` block: `eligible`, `reject_codes` (fixed taxonomy + precedence), `metrics`, and
+  `thresholds_used` (the exact floors applied, plus policy version and file path).
+- `data_quality` block: `complete`, `missing`, `range_ready`, `prices_known`, and
+  `missing_optional` for P2 gaps (never affects `complete`).
+- `fee_capture` block: `realized_fee_apr`, `volume_window`, `tvl`, `fee_tvl_ratio`, `fee_tier`,
+  `bin_step`, `tick_spacing`.
+- `expected_in_range_frac` at the **deployable** reference width (mirrors Sheldon's
+  `adaptive_half_width`: `0.5×vol_daily` held to a 1% price floor, 34-bin Meteora cap), with
+  self-describing provenance (`reference_half_width_pct`, `_units`, `width_unit`, `width_source`,
+  `vol_daily_pct`, `sigma_daily_pct`, `model`, and a 1/3/7-day `curve`).
+- `il_estimate_pct` (divergence loss at the band edge, horizon-independent).
+- `slippage_estimate_bps` at `$100`/`$1,000` plus the depth curve (`slippage_model.depth_proxy_usd`).
+- `pool_age_days`, `lp_lock` (`locked_pct`, `unlock_at`, `kind`, `source`), `tvl_trend_24h_pct`,
+  `owner_concentration_pct` (always `null` in v1 — no provider exposes it).
+- `pair_confidence` (0–1, deterministic rule table).
+- `pool_features_version`, `as_of` (Asia/Shanghai ISO), `scan_age_seconds`.
+- `blacklisted` reject code for Meteora `is_blacklisted` (config-gated, fail-closed).
+- `MultiDexScreener(clock=...)` injection so a scan is byte-reproducible in tests.
+- `pool_screener/tools/diff_eligibility.py`: three-way eligibility diff (legacy / v1-old-floors /
+  v1-active-policy) for shadow mode.
+- Fixtures: `pool_screener/tests/fixtures/provider_pools_2026-10-29.json` (raw) and
+  `pool_scan_2026-10-29.json` (real scan, frozen clock).
+
+### Changed
+
+- **Admission floors are lower and fully config-driven** (`missy_policy.json` version 2):
+  `min_tvl_usd 10k`, `min_volume_usd 1k`, `min_fee_tvl_ratio_pct 0.02`, `max_volatility_pct 75`,
+  `max_turnover_ratio 100`; new `min_pool_age_days 0`, `max_stable_depeg_pct 0.5`,
+  `max_scan_age_seconds 900`. A floor of `0` disables that gate. Lowering a floor needs no code change
+  (covered by `test_lowering_min_tvl_needs_config_only`).
+- Eligibility evaluation now emits structured codes and a legacy text reason generated from the same
+  decision, so the two cannot disagree. The five existing gate strings are unchanged.
+- `pool_features` weights/anchors/model tunables added to the policy, with validation that fails closed
+  (`PolicyError`) on malformed values.
+- `screened_at` now comes from the injectable clock (same epoch-seconds semantics); production is
+  unchanged because the default clock is `time.time`.
+- Terminal table gains `SAFE`/`OPP` columns; the policy-failure summary counts reject codes instead of
+  reason text.
+
+### Fixed
+
+- **Meteora `tvl_change_pct` was read as a percent delta.** It is a ratio to the prior window
+  (100 = flat: the observed distribution clusters on 100). It is now converted with `- 100`, and `0`
+  (no prior baseline) becomes `null` instead of a fabricated `+0%`. The first fixture capture emitted
+  `+94.6%` for a stable whale pool because of this.
+- **Orca `lockedPercentage` unit ambiguity** resolved explicitly (fraction → ×100) and tagged with
+  `source`/`kind`; out-of-range provider values become `null` rather than being clamped.
+- **`fee_known` no longer conflates "zero fees" with "missing fee data".** Dead pools with a known fee
+  tier are rejected by `low_fee_tvl`, not by `missing_data`.
+
+### Migration: `pool_features_version` 0 → 1
+
+- v0 = any record without `pool_features_version`. Consumers must keep working on v0 scans: gate on
+  `score`/`eligible` as before and ignore the v1 block.
+- v1 is purely additive. No field was removed or renamed; no consumer change is required to keep
+  running. The version is per record, so mixed files stay readable.
+- New consumers should gate on `safety.eligible` (+ `data_quality.range_ready`) and rank on the
+  fee-capture block; `score` remains available for audit and backtests.
+
+### Eligibility diff on the fixture (67 whitelisted pools)
+
+| Comparison | Eligible before → after | Flips |
+|---|---|---|
+| legacy gates → v1 evaluator, historical floors held | 19 → 19 | **0** |
+| v1 historical floors → v1 active floors | 19 → 26 | 7 (all newly eligible, none lost) |
+
+The contract change alone moves nobody; the 7 additions are the intended policy widening.
+Reproduce with `cd pool_screener && python3 tools/diff_eligibility.py --raw
+tests/fixtures/provider_pools_2026-10-29.json --prices-from tests/fixtures/pool_scan_2026-10-29.json`.
+
+### Verification against Sheldon (read-only, no changes made there)
+
+- Replayed the fixture through **Sheldon's live consumer** (`lp_scplic.score_pool_missy`): 67/67 pools
+  scored with no exceptions (18 `OPEN_CANDIDATE`, 10 `WATCH`, 39 `IGNORE`). `run_cycle.gates.
+  _filter_open_candidates()` and `_range_center()` also run unchanged; the new block is ignored as
+  intended.
+- Observation for Sheldon (pre-existing, not caused by this change): `scoring/pool/score.py::score_pool_missy`
+  imports `load_scoring_policy` from `scoring.config`, which does not define it (`ImportError`). The
+  live path (`lp_scplic.py`) is unaffected. Flagged in `docs/missy_sheldon_contract_v1.md`.
+
+### Shadow mode (next)
+
+Ship v1 as-is and leave Sheldon unchanged for 24 hourly cycles; watch scan size, runtime, JSON
+validity, and `safety.eligible` vs Sheldon's current gate. Only then remove `min_open_score`, the
+dual-model agreement gate, the adaptive-threshold re-tag and the legacy TVL/volume backstop.
+
 ## [Unreleased] - 2026-10-29 - Audit hardening
 
 Baseline: commit `40b357b`. Test suites: 176 passing before, **227 passing** after
