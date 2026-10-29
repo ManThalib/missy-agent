@@ -62,14 +62,21 @@ Meteora warning. A Meteora-only CLI scan rejects those incompatible windows.
 `--json` and `--watch` cannot be combined because repeated pretty-printed JSON
 documents would not form a valid JSON stream.
 
-Filter flags (`--min-tvl`, `--max-tvl`, `--min-fee-tvl`, `--min-daily-fee`,
-`--min-volume`, `--min-apr`, `--min-bin-step`/`--max-bin-step`,
-`--min-fee-pct`/`--max-fee-pct`, `--max-volatility`) are still parsed for CLI
-compatibility. Eligibility is enforced from `missy_policy.json`
-(`pool_eligibility` gates); pools that fail are still emitted with
-`eligible=false` and a `rejected_reason`. Every candidate carries the policy
-default score (`score`, `score_breakdown`, `score_model`/`score_version`) plus
-the experimental fee-capture score (`new_fc_score`, `new_score_breakdown`).
+Eligibility is enforced only from `missy_policy.json` (`pool_eligibility`
+gates). Pools that fail are still emitted with `eligible=false` and a
+`rejected_reason`, and the table lists them separately from qualified pools.
+Every candidate carries the policy default score (`score`, `score_breakdown`,
+`score_model`/`score_version`) plus the experimental fee-capture score
+(`new_fc_score`, `new_score_breakdown`), which uses daily fees.
+
+Threshold flags are parsed for compatibility but not enforced:
+`--min-fee-tvl`, `--min-daily-fee`, `--min-apr`, `--max-volatility`,
+`--min-fee-pct`, and `--max-fee-pct`. When one is set to a non-default value the
+CLI prints a warning. `--min-tvl`/`--max-tvl` and `--min-volume` reach the
+Meteora and Orca APIs only, and Raydium ignores them (also warned).
+`--min-bin-step`/`--max-bin-step` are applied by the Meteora API only.
+
+`--watch N` caps the HTTP cache at N seconds, so each poll reads fresh data.
 
 ## Environment
 
@@ -85,6 +92,7 @@ ORCA_API_BASE=https://api.orca.so/v2/solana
 METEORA_API_BASE=https://pool-discovery-api.datapi.meteora.ag
 JUPITER_PRICE_V2_URL=https://api.jup.ag/price/v3
 MISSY_CACHE_DIR=/tmp/missy-cache
+MISSY_CACHE_TTL_SECONDS=300
 ```
 
 ```bash
@@ -169,8 +177,10 @@ python3 main.py --wallet YOUR_SOLANA_WALLET --no-output-file
 The scanner fetches SOL and all SPL/Token-2022 balances, prices them in USD via
 the Jupiter Price API (default `https://api.jup.ag/price/v3`, no key required),
 and emits all assets sorted by USD value. Dust filtering is Sheldon's policy:
-`--threshold` is kept for CLI compatibility but the scanner ignores it, and
-`--include-dust` is a no-op that preserves the flag. Every scan record carries
+the scan output records the configured `--threshold` as `threshold_usd`, but no
+asset is filtered by it. `--include-dust` is accepted for compatibility and has
+no effect. An unwritable `--output-dir` prints a warning and does not stop the
+scan. Every scan record carries
 `wallet_id` (default `main`; `run_wallet.sh` writes
 `wallet_screen-<id>-<TS>.json` for mirror wallets and keeps the unsuffixed
 name for `main`). JSON/table screens are also written to `--output-dir`

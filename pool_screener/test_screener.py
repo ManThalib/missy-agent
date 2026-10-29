@@ -8,16 +8,18 @@ from dataclasses import asdict, replace
 from tempfile import NamedTemporaryFile
 from unittest.mock import Mock, patch
 
-from screener_py import multi_dex_screener
+import random
+import time
+
 from screener_py.client import MultiDexClient
-from screener_py.multi_dex_screener import (
+from screener_py.normalizers import _min_price_history_samples, _price_history_volatility
+from screener_py.tick_fetch import (
     _batch_fetch_ticks,
     _decode_active_bin_id,
     _decode_i32_at,
     _fetch_tick_with_retry,
-    _min_price_history_samples,
-    _price_history_volatility,
 )
+from core.retry import backoff_delay
 from core.rpc import RpcRateLimited
 from screener_py.pair_class import classify_pair
 from screener_py.policy_loader import DEFAULT_POLICY, PolicyError, load_policy
@@ -34,6 +36,13 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 
+def offline_price_client():
+    """Stub Jupiter price client so screening tests never touch the network."""
+    client = Mock()
+    client.fetch_prices.return_value = {}
+    return client
+
+
 class TestScreener(unittest.TestCase):
     def setUp(self):
         self.wl = Whitelist(
@@ -47,6 +56,7 @@ class TestScreener(unittest.TestCase):
             max_volatility=20.0,
         )
         self.screener = RaydiumScreener(whitelist=self.wl, config=self.config)
+        self.screener._jupiter_client = offline_price_client()
 
     def sample_pool(self):
         # Raw Raydium API v3 shape
@@ -548,7 +558,7 @@ class TestScreener(unittest.TestCase):
         self.assertTrue(cand.volatility_source)
         self.assertTrue(cand.apr_source)
         self.assertTrue(cand.apr_window)
-        self.assertEqual(cand.price_source, "jupiter_v2")
+        self.assertEqual(cand.price_source, "jupiter_v3")
         self.assertIn(cand.tick_source, {"none", "discovery_api", "rpc_batched", "rpc_single"})
 
     def test_projected_apr_is_capped_and_discounted(self):
@@ -666,9 +676,7 @@ class TickFallbackRetryTest(unittest.TestCase):
     def setUp(self):
         # Keep backoff sleeps instant; capture them for assertions.
         self.sleeps = []
-        sleep_patcher = patch.object(
-            multi_dex_screener.time, "sleep", side_effect=self.sleeps.append
-        )
+        sleep_patcher = patch.object(time, "sleep", side_effect=self.sleeps.append)
         sleep_patcher.start()
         self.addCleanup(sleep_patcher.stop)
 
@@ -685,6 +693,7 @@ class TickFallbackRetryTest(unittest.TestCase):
                 max_volatility=20.0,
             ),
         )
+        self.screener._jupiter_client = offline_price_client()
 
     @staticmethod
     def _meteora_raw_pool():
@@ -767,7 +776,10 @@ class TickFallbackRetryTest(unittest.TestCase):
             "id": 1,
             "result": self._account_response(76, -5308),
         }]
-        rpc._post.side_effect = [RpcRateLimited("429", retry_after=6.0), batch]
+        rpc.batch_partial.side_effect = [
+            RpcRateLimited("429", retry_after=6.0),
+            [(batch[0]["result"], None)],
+        ]
         result = _batch_fetch_ticks(
             rpc, [("meteora", addr)], retries=3, backoff_seconds=0.01, batch_size=20
         )
@@ -778,7 +790,7 @@ class TickFallbackRetryTest(unittest.TestCase):
     def test_batch_fetch_marks_unknown_after_exhausted_retries(self):
         addr = self.METEORA_POOL_ADDRESS
         rpc = Mock()
-        rpc._post.side_effect = RuntimeError("connection reset")
+        rpc.batch_partial.side_effect = RuntimeError("connection reset")
         result = _batch_fetch_ticks(
             rpc, [("meteora", addr)], retries=2, backoff_seconds=0.01, batch_size=20
         )
@@ -789,16 +801,12 @@ class TickFallbackRetryTest(unittest.TestCase):
         bad = "MeteoraPool222222222222222222222222222222222222"
         rpc = Mock()
 
-        def post(payload):
-            if payload[0]["params"][0] == bad:
+        def batch(calls):
+            if calls[0][1][0] == bad:
                 raise RuntimeError("transient")
-            return [{
-                "jsonrpc": "2.0",
-                "id": payload[0]["id"],
-                "result": self._account_response(81, 26726),
-            }]
+            return [(self._account_response(81, 26726), None)]
 
-        rpc._post.side_effect = post
+        rpc.batch_partial.side_effect = batch
         result = _batch_fetch_ticks(
             rpc,
             [("meteora", bad), ("orca", good)],
@@ -810,9 +818,9 @@ class TickFallbackRetryTest(unittest.TestCase):
         self.assertEqual(result[good], 26726)
 
     def test_backoff_delay_grows_and_jitters(self):
-        multi_dex_screener.random.seed(7)
+        random.seed(7)
         delays = [
-            multi_dex_screener._backoff_delay(attempt, 1.0)
+            backoff_delay(attempt, 1.0)
             for attempt in range(4)
         ]
         # Monotonic baseline growth, never below the un-jittered base.
@@ -820,9 +828,9 @@ class TickFallbackRetryTest(unittest.TestCase):
         self.assertLess(delays[0], delays[2])
         self.assertLess(delays[2], delays[3])
         # Retry-After overrides the exponential baseline (within the cap).
-        hinted = multi_dex_screener._backoff_delay(0, 1.0, retry_after=10.0)
+        hinted = backoff_delay(0, 1.0, retry_after=10.0)
         self.assertGreaterEqual(hinted, 10.0)
-        capped = multi_dex_screener._backoff_delay(0, 0.1, retry_after=999.0)
+        capped = backoff_delay(0, 0.1, retry_after=999.0)
         self.assertLessEqual(capped, 30.0 * 1.25)
 
 

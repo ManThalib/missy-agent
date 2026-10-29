@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any, Callable, Dict, List
 
+from core.retry import call_with_retry
 from core.rpc import RpcClient
 from core.wallet_balances import (
     fetch_sol_balance_lamports,
@@ -21,8 +21,9 @@ from .config import (
 class SolanaRpcClient:
     """Fetch native SOL and SPL token balances for a wallet.
 
-    Retries transient RPC failures with linear backoff and delegates the
-    ``jsonParsed`` traversal to the shared ``core.wallet_balances`` helpers.
+    Retries transient RPC failures (timeouts, 429, 5xx) with jittered
+    exponential backoff that honors Retry-After. Non-transient errors fail
+    immediately. The ``jsonParsed`` traversal lives in ``core.wallet_balances``.
     """
 
     def __init__(
@@ -53,15 +54,14 @@ class SolanaRpcClient:
         )
 
     def _with_retry(self, operation: Callable[[], Any], label: str) -> Any:
-        last_error: Exception = RuntimeError("no attempts made")
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                return operation()
-            except Exception as exc:
-                last_error = exc
-                if attempt == self.max_retries:
-                    break
-                time.sleep(self.backoff_seconds * attempt)
-        raise RuntimeError(
-            f"{label} failed after {self.max_retries} attempts: {last_error}"
-        ) from last_error
+        try:
+            return call_with_retry(
+                operation,
+                attempts=self.max_retries,
+                base_seconds=self.backoff_seconds,
+                retry_after_of=lambda exc: getattr(exc, "retry_after", None),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"{label} failed after {self.max_retries} attempts: {exc}"
+            ) from exc

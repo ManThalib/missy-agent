@@ -4,7 +4,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-from core.cache import DiskCache
+from core.cache import DiskCache, cache_ttl_from_env
 
 from ..filter_config import FilterConfig
 from .meteora_client import MeteoraClient
@@ -20,19 +20,23 @@ class MultiDexClient:
         timeout: float = 15.0,
         target_mints: Optional[List[str]] = None,
         cache: Optional[DiskCache] = None,
+        cache_ttl_seconds: Optional[float] = None,
     ) -> None:
         self.errors: Dict[str, str] = {}
+        self.cache_ttl_seconds = (
+            cache_ttl_seconds if cache_ttl_seconds is not None else cache_ttl_from_env()
+        )
         if cache is None and os.environ.get("MISSY_ENABLE_CACHE", "1") != "0":
-            cache = DiskCache(default_ttl_seconds=float(os.environ.get("MISSY_CACHE_TTL_SECONDS", "300")))
+            cache = DiskCache(default_ttl_seconds=self.cache_ttl_seconds)
         self.cache = cache
         self.clients: Dict[str, Any] = {
             "raydium": RaydiumClient(timeout=timeout, target_mints=target_mints),
             "orca": OrcaClient(timeout=timeout),
             "meteora": MeteoraClient(timeout=timeout),
         }
-        if self.cache is not None:
-            for client in self.clients.values():
-                client.cache = self.cache
+        for client in self.clients.values():
+            client.cache = self.cache
+            client.cache_ttl_seconds = self.cache_ttl_seconds
 
     def fetch_pools(
         self, config: FilterConfig, max_pages: int = 5
@@ -44,32 +48,23 @@ class MultiDexClient:
         pools: List[Dict[str, Any]] = []
         self.errors = {}
         successful_providers = 0
-        if len(names) == 1:
-            name = names[0]
-            try:
-                provider_pools = self.clients[name].fetch_pools(
-                    config, max_pages=max_pages
+        # One path for single and multi-provider scans: providers run
+        # concurrently and a failure in one never discards the others.
+        with ThreadPoolExecutor(max_workers=len(names)) as executor:
+            futures = {
+                name: executor.submit(
+                    self.clients[name].fetch_pools,
+                    config,
+                    max_pages=max_pages,
                 )
-                pools.extend(provider_pools)
-                successful_providers += 1
-            except Exception as exc:
-                self.errors[name] = str(exc)
-        else:
-            with ThreadPoolExecutor(max_workers=len(names)) as executor:
-                futures = {
-                    name: executor.submit(
-                        self.clients[name].fetch_pools,
-                        config,
-                        max_pages=max_pages,
-                    )
-                    for name in names
-                }
-                for name in names:
-                    try:
-                        pools.extend(futures[name].result())
-                        successful_providers += 1
-                    except Exception as exc:
-                        self.errors[name] = str(exc)
+                for name in names
+            }
+            for name in names:
+                try:
+                    pools.extend(futures[name].result())
+                    successful_providers += 1
+                except Exception as exc:
+                    self.errors[name] = str(exc)
         if successful_providers == 0:
             failures = "; ".join(
                 f"{name}: {error}" for name, error in self.errors.items()

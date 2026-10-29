@@ -1,24 +1,34 @@
+"""Manual live check of the Raydium pool API (network access required).
+
+Not a unit test: it calls the public API, so it runs only as a script:
+    python3 test_raydium.py
+"""
+
 import sys
 import time
-sys.path.insert(0, '.')
+import traceback
+
+sys.path.insert(0, ".")
 
 from pool_screener.screener_py.clients.raydium_client import RaydiumClient
 from pool_screener.screener_py.filter_config import FilterConfig
 
-print("Creating RaydiumClient...")
-client = RaydiumClient(timeout=10.0)
-print("Creating FilterConfig...")
-config = FilterConfig()
-print("Calling fetch_pools...")
-start = time.time()
-try:
-    pools = client.fetch_pools(config, max_pages=1)
-    elapsed = time.time() - start
-    print(f"Success! Got {len(pools)} pools in {elapsed:.2f} seconds")
+
+def main() -> int:
+    client = RaydiumClient(timeout=10.0)
+    config = FilterConfig()
+    start = time.time()
+    try:
+        pools = client.fetch_pools(config, max_pages=1)
+    except Exception as exc:
+        print(f"Error after {time.time() - start:.2f} seconds: {exc}")
+        traceback.print_exc()
+        return 1
+    print(f"Success! Got {len(pools)} pools in {time.time() - start:.2f} seconds")
     if pools:
         print("First pool:", pools[0])
-except Exception as e:
-    elapsed = time.time() - start
-    print(f"Error after {elapsed:.2f} seconds: {e}")
-    import traceback
-    traceback.print_exc()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

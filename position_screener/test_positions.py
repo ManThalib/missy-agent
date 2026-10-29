@@ -836,7 +836,7 @@ class TestEnrichmentGuardrails(unittest.TestCase):
         errors = {}
         original = enrichment._compute_value
 
-        def explode(position, pool):
+        def explode(position, pool, amounts=None):
             if position is poisoned:
                 raise RuntimeError("boom")
             return original(position, pool)

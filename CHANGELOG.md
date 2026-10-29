@@ -2,6 +2,155 @@
 
 All notable changes to the Missy-agent Multi-DEX Screener Suite are documented here.
 
+## [Unreleased] - 2026-10-29 - Audit hardening
+
+Baseline: commit `40b357b`. Test suites: 176 passing before, **227 passing** after
+(51 new regression tests in `core/test_hardening.py`, `pool_screener/test_hardening.py`,
+`position_screener/test_hardening.py`, and `wallet_screener/test_hardening.py`).
+Live checks: `pool_screener.py --dex meteora` and `--dex all` ran against the real
+provider APIs; a live Jupiter price call returned SOL and USDC prices.
+
+### Fixed
+
+- **Orca pending fees always fell back to checkpoints.** `_fetch_position_data`
+  called `RpcClient()` with no URL (a `TypeError`, swallowed). Position accounts
+  are now read in one batch through the configured RPC.
+- **Position-scan wallet valuation was always zero.** Raw RPC token entries were
+  indexed as flat records, so `wallet_balances` was empty, and `sol_price_usd` /
+  `wallet_total_usd` were never set. Balances now parse via
+  `core.wallet_balances.parse_token_account` and are priced through Jupiter.
+- **"Closed since last scan" never fired.** The closure state was refreshed twice
+  (scanner, then CLI). The scanner is now the single owner and returns
+  `newly_closed_keys` on the scan result.
+- **Fee-capture score used window fees as daily fees.** For `--timeframe 7d/30d`
+  `new_fc_score` was overstated by about 7x or 30x. It now converts to daily fees.
+- **Watch mode served stale data.** HTTP responses were cached for a hardcoded
+  300 s regardless of the poll interval. The TTL now follows
+  `MISSY_CACHE_TTL_SECONDS` and is capped at the `--watch` interval.
+- **Ineligible pools were printed as "QUALIFIED".** The table lists only eligible
+  pools; policy failures are summarized separately by gate.
+- **Look-alike tokens could pass the whitelist.** Matching was by symbol alone. A
+  canonical mint is now authoritative when the token supplies an address.
+  Symbol-only matching remains for symbols that have no canonical mint.
+- **Invalid canonical mints.** The WBTC constant was 43 characters and the WETH
+  constant was 45 characters, so neither could match by address. Corrected to
+  `3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh` (Wormhole WBTC) and
+  `7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs` (Wormhole WETH). Both validate as
+  base58 addresses.
+- **Negative tick truncation.** Tick derivation used `int()` (rounds toward zero),
+  giving an off-by-one tick for negative-tick pools. It now uses `math.floor`.
+- **Meteora pool identity.** The normalizer falls back to `address` when
+  `pool_address` is absent, so RPC lookups and position matching keep the pool id.
+- **Meteora "prices" without a bin step.** Bin IDs were reported as prices. They
+  are now reported as unknown (`0.0`).
+- **Dead RPC cost.** A failed tick batch backed off about 95 s, then retried every
+  pool individually (about 1.5 s each). Batch backoff is now capped at a 30 s
+  planned-sleep budget, and a fully failed batch skips per-pool fallbacks.
+- **Needless Meteora RPC calls.** Pools whose discovery payload already carried the
+  active bin were still fetched over RPC. They are now skipped.
+- **Raydium target-mint mode ignored `--pages`.** Only the first page per mint was
+  fetched. It now pages up to `--pages`, pausing before each request.
+- **Wallet CLI crashed on an unwritable output directory.** A failed screen-file
+  write is now a warning.
+- **Wallet scan output lacked `threshold_usd`.** It is now emitted (AGENTS.md
+  compatibility), and the "no assets" message no longer claims a threshold.
+- **Retries hit non-transient errors.** Wallet and RPC retries now apply only to
+  transient failures (timeouts, 429, 5xx), honoring a capped `Retry-After`.
+- **Enrichment hid pool-scan problems.** An unreadable or missing pool scan is now
+  recorded in `errors["pool_scan"]`.
+- **Secrets in error text.** HTTP error messages redact `api-key` and similar
+  query parameters (`core.http_client.redact_url`).
+- **Token amounts lost precision** above 2**53 raw units. They now use `Decimal`.
+- **Meteora cron wrapper** had a hardcoded `/data/missy-agent` path. It now resolves
+  its own directory, as the other wrappers do.
+
+### Changed (behavior and output)
+
+| Area | Previous | Current |
+|---|---|---|
+| Fee-capture `new_fc_score` (7d/30d) | Window fees treated as daily | Daily fee (`fee / window_days`) |
+| `price_source` label | `jupiter_v2` | `jupiter_v3` (the API in use) |
+| Ineligible pools in the table | Listed as "QUALIFIED" | Listed under a policy-rejection summary |
+| Watch-mode cache TTL | Fixed 300 s | `min(MISSY_CACHE_TTL_SECONDS, --watch)` |
+| Token matching | Symbol or mint | Mint authoritative when present; symbol-only only without a canonical mint |
+| Raydium target mints | 1 request per mint | Up to `--pages` requests per mint |
+| NFT position discovery | One `getProgramAccounts` scan per NFT | Derived PDA `["position", mint]`, batched `getAccountInfo` |
+| Position closure detection | Broken (refreshed twice) | One owner; `newly_closed_keys` on the scan |
+| Position wallet valuation | Empty balances, zero totals | Parsed balances, priced totals |
+| Wallet balances commitment (position scan) | `finalized` | `confirmed` (same view as NFT discovery) |
+| Wallet SOL token label | `wSOL` | `SOL` (shared mint map) |
+| Enrichment position value key | `position_value_usd` only | Also `position_value_quote` (what analytics reads) |
+| Meteora bin-step filter | Sent server-side, documented as not enforced | Documented as server-side for Meteora |
+| Threshold flags (`--min-fee-tvl`, `--min-apr`, ...) | Silently ignored | Warned on stderr; policy gates apply |
+| Empty-wallet position scan | 2 retries (6 s) and 2 extra provider scans | 1 retry (3 s) and 1 extra scan |
+| Cache file names | Unversioned keys | Length-prefixed keys (old entries become misses) |
+| HTTP connections | New TCP/TLS per request | Persistent per host |
+| `pool_screener.py --watch -5` | Accepted silently | Rejected |
+
+Note: `position_value_quote` is currently the USD position value. Fee APR still
+needs a window fee delta, so `fee_value_delta_quote` remains unset.
+
+### Added
+
+- `core/retry.py`: transient-only retries with jittered backoff and capped
+  `Retry-After`.
+- `core/rpc.py`: `RpcRequestError` (carries `status_code` and `transient`) and
+  `RpcClient.batch_partial()` (per-item results, so one failing account does not
+  fail the batch).
+- `core/http_client.py`: persistent per-host connections, redirect following,
+  `HttpStatusError`, `redact_url()`, per-client `cache_ttl_seconds`.
+- `core/cache.py`: `cache_ttl_from_env()`; atomic writes; directory created `0700`.
+- `core/constants.py`: `WBTC_MINT`, `WETH_MINT`, `TAO_MINT`, `KNOWN_MINT_SYMBOLS`.
+- `core/wallet_balances.py`: `parse_token_account()`; `fetch_token_accounts(commitment=...)`.
+- `pool_screener/screener_py/normalizers.py` and `tick_fetch.py`: split from
+  `multi_dex_screener.py`.
+- `MISSY_POOL_SCAN_DIR`: overrides the pool-scan directory used by enrichment.
+- `PositionScan.newly_closed_keys` (serialized in JSON output).
+
+### Removed (dead or duplicate code)
+
+- `_inject_token_prices`, duplicate `_range_volatility`, `_volatility`, unused
+  `defaultdict` import, `_PRICE_HISTORY_SAMPLE_HOURS`, `DEFAULT_RATE_LIMIT_SECONDS`.
+- `_decode_orca_pool_rewards`, `_fetch_position_data`, `_sha256`, a dead store in
+  `_is_on_curve`, the duplicated per-DEX discriminator helpers (now
+  `core.solana.discriminator`), and the duplicated retry block in `scan()`.
+- The urllib opener in the HTTP client (`_opener`, `_IPv4HTTPHandler`,
+  `_IPv4HTTPSHandler`). The IPv4-only connection classes remain.
+- `BalanceCalculator.enrich` no-op branch and the wallet's duplicate
+  `KNOWN_MINT_SYMBOLS`.
+- A live network call that ran at import time in `test_raydium.py` (now a
+  `__main__` script).
+
+### Refactored
+
+- `multi_dex_screener.py` (1093 lines) split into `normalizers.py` (normalization
+  only), `tick_fetch.py` (RPC tick/bin lookup and backoff), and
+  `multi_dex_screener.py` (policy, gating, scoring, assembly). Public names are
+  unchanged: `normalize_pool`, `MultiDexScreener`, `RaydiumScreener`, and
+  `MeteoraScreener`.
+- Each pool is normalized once per phase (previously about five times).
+- `MultiDexClient` uses one concurrent path for single and multi-provider scans.
+- Position scans read Orca and Meteora accounts through one shared batch helper.
+- Pending-fee reads now use `batch_partial` instead of `rpc._post`.
+- Meteora decoder offsets computed once.
+- Typing: implicit `Optional` defaults fixed, and the `import math` placement in
+  `pool_scorer.py` corrected.
+
+### Deferred (with reasons)
+
+- **`screener_py/__init__.py` `sys.path` mutation** is kept. Removing it needs path
+  setup in about ten test and entry files and would change the documented run commands.
+- **Fee APR** (`_fee_apr_pct`, analytics `fee_value_delta_quote`) stays unavailable.
+  A window fee delta needs snapshot history; `fees_owed` is cumulative since the
+  last claim and cannot be turned into an honest window delta.
+- **Threshold enforcement** (`--min-fee-tvl`, `--min-apr`, ...) is still Sheldon's
+  decision. They now warn instead of silently doing nothing.
+- **Dev linters** (`ruff`, `flake8`) were not added, because AGENTS.md forbids new
+  dependencies without approval.
+- **Long lines and style debt** in the position modules are not mass-reformatted.
+- **Live RPC validation** of the derived-PDA NFT lookup, the Orca batch path, and
+  the closure flow has not been run. These are covered by mocked tests only.
+
 ## [Unreleased] - 2026-10-07
 
 ### Changed

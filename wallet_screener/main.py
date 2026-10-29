@@ -56,7 +56,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         "--threshold",
         type=float,
         default=0.0,
-        help="Minimum total USD value required to display an asset (kept for CLI compatibility; scanner ignores it)",
+        help="Dust threshold recorded in the output for policy consumers; no assets are filtered",
     )
     parser.add_argument(
         "--rpc-url",
@@ -68,7 +68,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         "--price-url",
         type=str,
         default=JUPITER_PRICE_URL,
-        help="Jupiter Price API v2 base URL",
+        help="Jupiter Price API v3 base URL",
     )
     parser.add_argument(
         "--timeout",
@@ -88,7 +88,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--include-dust",
         action="store_true",
-        help="Show assets at or below the threshold (disables filtering)",
+        help="Accepted for compatibility; assets are never filtered by this CLI",
     )
     parser.add_argument(
         "--output-dir",
@@ -117,10 +117,7 @@ def print_scan(result: Dict[str, Any]) -> None:
     print(f"WALLET ASSETS  {result.get('wallet', '')}")
     print(SEPARATOR)
     if not assets:
-        print(
-            "No assets above the "
-            f"${result.get('threshold_usd', 0):.2f} threshold."
-        )
+        print("No assets found for this wallet.")
         print(SEPARATOR)
         return
     print(f"{'SYMBOL':<10} | {'MINT':<44} | {'AMOUNT':>18} | {'PRICE $':>12} | {'VALUE $':>12}")
@@ -143,13 +140,18 @@ def print_scan(result: Dict[str, Any]) -> None:
 
 
 def _write_output_file(args: argparse.Namespace, result: Dict[str, Any]) -> str | None:
+    """Write the screen JSON; a write failure is a warning, never a crash."""
     if args.no_output_file or not args.output_dir:
         return None
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    path = output_dir / f"wallet_screen-{timestamp}.json"
-    path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    try:
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"wallet_screen-{timestamp}.json"
+        path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    except OSError as exc:
+        print(f"Warning: screen file not written: {exc}", file=sys.stderr)
+        return None
     return str(path)
 
 

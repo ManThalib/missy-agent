@@ -25,6 +25,11 @@ def _score_action(
     score: float,
     input_count: int,
 ) -> str:
+    """Display-only action label for the terminal table.
+
+    These labels are a convenience for operators, not policy. Strategy
+    decisions belong to Sheldon; the JSON output carries only facts and scores.
+    """
     if status == "closed":
         return "Closed"
     if status == "inactive":

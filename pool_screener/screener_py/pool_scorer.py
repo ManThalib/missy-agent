@@ -1,6 +1,6 @@
-import math
 """Provider-neutral pool scoring implementation."""
 
+import math
 from math import isfinite, log1p
 from typing import Dict, Optional
 
@@ -123,21 +123,28 @@ class PoolScorer:
         """Fee‑capture‑centric scoring (0‑100) and sub‑components.
 
         Weights (sum 100):
-        - Fee‑yield (35 %): log‑scaled fee‑per‑TVL ratio.
-        - Absolute fee (25 %): daily fee USD relative to a 200 USD benchmark.
-        - Liquidity effectiveness (20 %): penalty for volatility away from 15 %.
-        - Turnover penalty (10 %): reward for moderate turnover, cap at 20× TVL/day.
-        - LP‑share adjustment (10 %): proportion of fees that go to a single LP.
+        - Fee‑yield (35 %): log‑scaled fee‑per‑TVL ratio.
+        - Absolute fee (25 %): daily fee USD relative to a 200 USD benchmark.
+        - Liquidity effectiveness (20 %): penalty for volatility away from 15 %.
+        - Turnover penalty (10 %): reward for moderate turnover, cap at 20× TVL/day.
+        - LP‑share adjustment (10 %): proportion of fees that go to a single LP.
+
+        ``observation.fee_usd`` is the fee total over ``window_days``; it is
+        converted to a daily figure here, matching ``score()``.
         """
         cfg = self.config
         tvl = self._non_negative(observation.tvl_usd)
         effective_factor = self._active_liquidity_factor(observation.pool_type)
         effective_tvl = tvl * effective_factor
-        daily_fee_usd = self._non_negative(observation.fee_usd) * self._bounded(observation.lp_fee_share)
+        days = self._non_negative(observation.window_days) or 1.0
+        daily_fee_usd = (
+            self._non_negative(observation.fee_usd)
+            * self._bounded(observation.lp_fee_share)
+            / days
+        )
         fee_tvl_ratio = (daily_fee_usd / tvl * 100.0) if tvl > 0.0 else 0.0
         volatility = self._non_negative(observation.volatility_pct) if observation.volatility_pct is not None else 0.0
         volume = self._non_negative(observation.volume_usd)
-        days = self._non_negative(observation.window_days) or 1.0
         lp_share = self._bounded(observation.lp_fee_share)
 
         daily_turnover = (volume / days) / effective_tvl if effective_tvl > 0.0 else 0.0

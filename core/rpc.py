@@ -11,7 +11,25 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-class RpcRateLimited(RuntimeError):
+class RpcRequestError(RuntimeError):
+    """A failed RPC HTTP request, classified for retry decisions.
+
+    ``transient`` is True for transport failures (timeouts, resets, DNS) and
+    for HTTP 5xx; ``status_code`` carries the HTTP status when there was one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        transient: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.transient = transient
+
+
+class RpcRateLimited(RpcRequestError):
     """The RPC endpoint answered HTTP 429 (rate limited).
 
     Carries the server's Retry-After hint in seconds when the header is
@@ -20,7 +38,7 @@ class RpcRateLimited(RuntimeError):
     """
 
     def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
-        super().__init__(message)
+        super().__init__(message, status_code=429, transient=True)
         self.retry_after = retry_after
 
 
@@ -77,9 +95,16 @@ class RpcClient:
                         exc.headers.get("Retry-After") if exc.headers else None
                     ),
                 ) from exc
-            raise RuntimeError(f"RPC request failed: {exc}") from exc
-        except (urllib.error.URLError, ValueError) as exc:
-            raise RuntimeError(f"RPC request failed: {exc}") from exc
+            raise RpcRequestError(
+                f"RPC request failed: {exc}",
+                status_code=exc.code,
+                transient=exc.code >= 500,
+            ) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            # Transport failures (DNS, reset, timeout) are worth retrying.
+            raise RpcRequestError(f"RPC request failed: {exc}", transient=True) from exc
+        except ValueError as exc:
+            raise RpcRequestError(f"RPC request failed: {exc}") from exc
 
     def call(self, method: str, params: List[Any]) -> Any:
         request_id = self._reserve_request_ids()[0]
@@ -148,4 +173,39 @@ class RpcClient:
             if item.get("error"):
                 raise RuntimeError(f"Batch RPC request failed: {item['error']}")
             results.append(item.get("result"))
+        return results
+
+    def batch_partial(
+        self, calls: Iterable[Tuple[str, List[Any]]]
+    ) -> List[Tuple[Any, Optional[str]]]:
+        """Batch calls where each item succeeds or fails independently.
+
+        Returns ``(result, error)`` per call in request order. A transport or
+        HTTP-level failure (including 429) still raises for the whole batch.
+        Items missing from the response are reported as errors.
+        """
+        call_list = list(calls)
+        if not call_list:
+            return []
+        order = self._reserve_request_ids(len(call_list))
+        payload = [
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            for request_id, (method, params) in zip(order, call_list)
+        ]
+        body = self._post(payload)
+        if not isinstance(body, list):
+            raise RuntimeError("Invalid batch RPC response")
+        by_id: Dict[int, Any] = {}
+        for item in body:
+            if isinstance(item, dict) and item.get("id") is not None:
+                by_id.setdefault(item.get("id"), item)
+        results: List[Tuple[Any, Optional[str]]] = []
+        for request_id in order:
+            item = by_id.get(request_id)
+            if item is None:
+                results.append((None, "missing from batch response"))
+            elif item.get("error"):
+                results.append((None, str(item["error"])))
+            else:
+                results.append((item.get("result"), None))
         return results

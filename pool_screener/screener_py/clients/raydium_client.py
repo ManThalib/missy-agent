@@ -65,38 +65,39 @@ class RaydiumClient(HttpJsonClient):
         self, config: FilterConfig, max_pages: int = 5
     ) -> List[Dict[str, Any]]:
         if self.target_mints:
-            return self._fetch_by_target_mints(config)
+            return self._fetch_by_target_mints(config, max_pages)
         return self._fetch_top_pools(config, max_pages)
 
     def _fetch_by_target_mints(
-        self, config: FilterConfig
+        self, config: FilterConfig, max_pages: int = 5
     ) -> List[Dict[str, Any]]:
         """Fetch only pools where one side is a target mint.
 
-        The Raydium /poolsByMint endpoint is constrained to a single mint.
-        We query every target mint once and de-duplicate by pool id. To avoid
-        exploding the number of requests, we do not pre-cross with every quote
-        mint; instead we filter in-memory for pools whose other side is an
-        configured quote asset or matches another target mint.
+        The Raydium /poolsByMint endpoint is constrained to a single mint, so
+        each target mint is paged (up to *max_pages*, stopping early on a short
+        page) and results are de-duplicated by pool id. Every request is
+        preceded by the standard inter-request pause after the first.
         """
         all_pools: List[Dict[str, Any]] = []
         seen: set = set()
         page_size = min(100, max(1, int(config.page_size or 100)))
+        first_request = True
         for mint in self.target_mints:
-            # One page per target mint is enough to cover the most liquid
-            # pools; the whitelist filter discards the rest anyway.
-            page = 1
-            pools = self.fetch_pools_by_mint(
-                mint, pool_type="all", page_size=page_size, page=page
-            )
-            for pool in pools:
-                pid = pool.get("id")
-                if pid in seen:
-                    continue
-                seen.add(pid)
-                all_pools.append(pool)
-            if len(pools) == page_size and len(self.target_mints) > 1:
-                self._pause()
+            for page in range(1, max(1, max_pages) + 1):
+                if not first_request:
+                    self._pause()
+                first_request = False
+                pools = self.fetch_pools_by_mint(
+                    mint, pool_type="all", page_size=page_size, page=page
+                )
+                for pool in pools:
+                    pid = pool.get("id")
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    all_pools.append(pool)
+                if len(pools) < page_size:
+                    break
         return [{**p, "_dex": "raydium"} for p in all_pools]
 
     def _fetch_top_pools(

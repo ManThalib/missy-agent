@@ -5,7 +5,6 @@ import time
 import traceback
 
 from screener_position_py import PositionScanner
-from screener_position_py.analytics.closure_state import scan_closure_state
 from screener_position_py.display import print_positions
 
 def _non_negative_int(value: str) -> int:
@@ -102,22 +101,10 @@ def main() -> int:
         for source, error in position_scan.errors.items():
             print(f"Warning: position {source}: {error}", file=sys.stderr)
 
-        newly_closed = set()
-        try:
-            _, newly_closed_keys = scan_closure_state(
-                position_scan.positions,
-                state_path=args.closure_state_path,
-            )
-            newly_closed = set(newly_closed_keys)
-            if newly_closed_keys:
-                print(
-                    f"Note: {len(newly_closed_keys)} position(s) "
-                    "closed since last scan",
-                    file=sys.stderr,
-                )
-        except OSError as exc:
+        newly_closed = set(position_scan.newly_closed_keys)
+        if newly_closed:
             print(
-                f"Warning: closure state could not be saved: {exc}",
+                f"Note: {len(newly_closed)} position(s) closed since last scan",
                 file=sys.stderr,
             )
 

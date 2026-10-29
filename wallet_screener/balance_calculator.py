@@ -29,8 +29,6 @@ class BalanceCalculator:
         """Attach prices and recompute total_value_usd for each balance."""
         for balance in balances:
             price = prices.get(balance.mint, 0.0)
-            if price <= 0 and balance.mint == "":
-                continue
             balance.price_usd = price
             balance.total_value_usd = self.calculate(balance.amount_ui, price)
         return balances

@@ -5,17 +5,20 @@ import os
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from core.constants import LAMPORTS_PER_SOL, SOL_MINT
+from core.prices import JupiterPriceClient
 from core.solana import (
     b58decode as _b58decode,
     b58encode as _b58encode,
     discriminator as _discriminator,
+    is_valid_solana_address,
 )
 from core.wallet_balances import (
-    TOKEN_PROGRAMS,
     fetch_sol_balance_lamports,
     fetch_token_accounts,
+    parse_token_account,
 )
 
 from .helius_history_client import HeliusHistoryClient
@@ -27,7 +30,7 @@ from .liquidity_position import LiquidityPosition
 from .meteora_pending import MeteoraPendingFeesFetcher
 from .orca_pending import OrcaPendingFeesFetcher
 from .position_scan import PositionScan
-from .raydium_pending import PendingFeesFetcher, raydium_position_checkpoint
+from .raydium_pending import PendingFeesFetcher, _pda, raydium_position_checkpoint
 from .rpc_client import RpcClient
 
 METEORA_PROGRAM = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
@@ -39,6 +42,8 @@ PROGRAM_DEX = {
     ORCA_PROGRAM: "orca",
 }
 _RPC_BATCH_SIZE = 50
+# Fresh position NFTs can take several seconds to index; one retry covers it.
+_INDEXING_RETRY_SECONDS = 3.0
 
 
 def _account_bytes(account: Dict[str, Any]) -> bytes:
@@ -92,6 +97,7 @@ class PositionScanner:
         self.pending_fees = PendingFeesFetcher(self.rpc)
         self.meteora_fees = MeteoraPendingFeesFetcher(self.rpc)
         self._reward_decimals_cache: Dict[tuple, List[int]] = {}
+        self._last_token_accounts: Optional[List[Dict[str, Any]]] = None
 
     def _refresh_raydium_pending(self, positions: List[LiquidityPosition]) -> None:
         """Recompute real pending fees/rewards for Raydium CLMM positions.
@@ -107,7 +113,7 @@ class PositionScanner:
         if not any(p.dex == "raydium" and p.status == "active" for p in positions):
             return
         try:
-            accounts = self._fetch_raydium_position_accounts(
+            accounts = self._fetch_account_bytes(
                 [p.position_address for p in positions
                  if p.dex == "raydium" and p.status == "active"]
             )
@@ -153,75 +159,41 @@ class PositionScanner:
     def _refresh_orca_pending(self, positions: List[LiquidityPosition]) -> None:
         """Compute live pending fees/rewards for Orca Whirlpool positions.
 
-        Uses OrcaPendingFeesFetcher.compute_pending() to fetch live pool state
-        + boundary tick arrays and apply SDK math, so that pending amounts reflect
-        actual accrual rather than stale checkpointed values. Best-effort: a
-        failure keeps the checkpointed values and records the error.
+        Position accounts are read in one batch, then OrcaPendingFeesFetcher
+        applies the SDK math against live pool state. Best-effort: a failure
+        keeps the checkpointed values and records the error per position.
         """
         active = [p for p in positions if p.dex == "orca" and p.status == "active"]
         if not active:
             return
+        try:
+            blobs = self._fetch_account_bytes([p.position_address for p in active])
+        except Exception as exc:
+            blobs = {}
+            batch_error = f"position refetch failed: {exc}"
+        else:
+            batch_error = ""
 
         fetcher = OrcaPendingFeesFetcher(self.rpc)
-
         for position in active:
+            if position.pool_enrichment is None:
+                position.pool_enrichment = {}
             try:
-                out = fetcher.compute_pending(
-                    position.pool_address,
-                    self._fetch_position_data(position.position_address),
-                    None,
-                )
+                data = blobs.get(position.position_address)
+                if data is None:
+                    raise ValueError(batch_error or f"Position account not found: {position.position_address}")
+                out = fetcher.compute_pending(position.pool_address, data, None)
                 position.fees_owed_raw = [int(v) for v in out["fees_owed_raw"]]
                 position.rewards_owed_raw = [int(v) for v in out["rewards_owed_raw"]]
                 position.reward_mints = [m if m else "" for m in out["reward_mints"]]
-                position.reward_decimals = self._reward_decimals(
-                    position.reward_mints
-                )
+                position.reward_decimals = self._reward_decimals(position.reward_mints)
                 position.pending_fees_source = "computed"
-                if position.pool_enrichment is None:
-                    position.pool_enrichment = {}
                 position.pool_enrichment["pending_fees_source"] = "computed"
             except Exception as exc:
                 # Keep checkpointed values on failure; label the error.
                 position.pending_fees_source = "raw_checkpoint"
-                if position.pool_enrichment is None:
-                    position.pool_enrichment = {}
                 position.pool_enrichment["pending_fees_error"] = str(exc)
                 position.pool_enrichment["pending_fees_source"] = "raw_checkpoint"
-
-    @staticmethod
-    def _fetch_position_data(position_address: str) -> bytes:
-        """Fetch the raw Position account bytes for a given address."""
-        from core.rpc import RpcClient
-        import base64
-
-        result = RpcClient().call(
-            "getAccountInfo", [position_address, {"encoding": "base64"}]
-        )
-        value = (result or {}).get("value")
-        if not value:
-            raise ValueError(f"Position account not found: {position_address}")
-        return base64.b64decode(value["data"][0])
-
-    @staticmethod
-    def _decode_orca_pool_rewards(data: bytes) -> List[str]:
-        """Return up to 3 reward mints from an Orca Whirlpool pool account.
-
-        Best-effort: the layout is the anchor Whirlpool state. Failures
-        return an empty list rather than raising.
-        """
-        if len(data) < 389:
-            return []
-        reward_info_start = 125
-        reward_info_stride = 88
-        mints: List[str] = []
-        for i in range(3):
-            offset = reward_info_start + i * reward_info_stride
-            if offset + 32 > len(data):
-                break
-            mint = _b58encode(data[offset:offset + 32])
-            mints.append(mint)
-        return mints
 
     def _refresh_meteora_pending(self, positions: List[LiquidityPosition]) -> None:
         """Compute live fees/rewards/token amounts for Meteora DLMM positions.
@@ -247,7 +219,7 @@ class PositionScanner:
         if not active:
             return
         try:
-            raw_accounts = self._fetch_meteora_position_accounts(
+            raw_accounts = self._fetch_account_bytes(
                 [p.position_address for p in active if p.position_address]
             )
         except Exception as exc:
@@ -279,10 +251,10 @@ class PositionScanner:
             position.pending_fees_source = "computed"
             position.pool_enrichment["pending_fees_source"] = "computed"
 
-    def _fetch_meteora_position_accounts(
+    def _fetch_account_bytes(
         self, addresses: Sequence[str]
     ) -> Dict[str, Optional[bytes]]:
-        """Batch-fetch raw Meteora position account data by address."""
+        """Batch-fetch raw account data by address; missing accounts map to None."""
         out: Dict[str, Optional[bytes]] = {}
         for start in range(0, len(addresses), _RPC_BATCH_SIZE):
             batch = addresses[start:start + _RPC_BATCH_SIZE]
@@ -291,28 +263,7 @@ class PositionScanner:
             )
             for addr, res in zip(batch, results):
                 value = (res or {}).get("value")
-                out[addr] = (
-                    base64.b64decode(value["data"][0]) if value else None
-                )
-        return out
-
-    def _fetch_raydium_position_accounts(
-        self, addresses: Sequence[str]
-    ) -> Dict[str, Optional[bytes]]:
-        """Batch-fetch raw PersonalPositionState account data by address."""
-        import base64
-
-        out: Dict[str, Optional[bytes]] = {}
-        for start in range(0, len(addresses), _RPC_BATCH_SIZE):
-            batch = addresses[start : start + _RPC_BATCH_SIZE]
-            results = self.rpc.batch(
-                [("getAccountInfo", [a, {"encoding": "base64"}]) for a in batch]
-            )
-            for addr, res in zip(batch, results):
-                value = (res or {}).get("value")
-                out[addr] = (
-                    base64.b64decode(value["data"][0]) if value else None
-                )
+                out[addr] = base64.b64decode(value["data"][0]) if value else None
         return out
 
     def _reward_decimals(self, mints: Sequence[str]) -> List[int]:
@@ -357,13 +308,8 @@ class PositionScanner:
         closure_state_path: Optional[str] = None,
         wallet_id: str = "main",
     ) -> PositionScan:
-        try:
-            if len(_b58decode(wallet)) != 32:
-                raise ValueError
-        except Exception:
-            raise ValueError(
-                f"wallet must be a 32-byte Solana base58 address: {wallet!r}"
-            ) from None
+        if not is_valid_solana_address(wallet):
+            raise ValueError(f"wallet must be a 32-byte Solana base58 address: {wallet!r}")
         normalized_dex = dex.lower()
         supported = {"all", "meteora", "raydium", "orca"}
         if normalized_dex not in supported:
@@ -375,10 +321,6 @@ class PositionScanner:
             if normalized_dex == "all"
             else [normalized_dex]
         )
-        errors: Dict[str, str] = {}
-        current: List[LiquidityPosition] = []
-        successful_providers = 0
-
         current, errors, successful_providers = self._fetch_current(wallet, selected)
 
         if successful_providers == 0:
@@ -388,27 +330,10 @@ class PositionScanner:
             raise RuntimeError(f"All selected position providers failed: {failures}")
 
         if not current or errors:
-            # Freshly opened positions race RPC indexing (a just-minted
-            # position NFT can be invisible to a confirmed
-            # getTokenAccountsByOwner for several seconds). An empty or
-            # partial wallet here makes downstream dedup think nothing is
-            # held and re-open the same pool. Retry once before reporting.
-            time.sleep(3.0)
-            retry_current, retry_errors, retry_providers = self._fetch_current(
-                wallet, selected
-            )
-            if retry_current or not retry_errors:
-                current = retry_current
-                errors = retry_errors
-                successful_providers = retry_providers
-
-        if not current or errors:
-            # Freshly opened positions race RPC indexing (a just-minted
-            # position NFT can be invisible to a finalized/confirmed
-            # getTokenAccountsByOwner for several seconds). An empty or
-            # partial wallet here makes downstream dedup think nothing is
-            # held and re-open the same pool. Retry once before reporting.
-            time.sleep(3.0)
+            # Freshly opened positions race RPC indexing; an empty or partial
+            # view here would make downstream dedup re-open held pools. One
+            # retry after a short pause covers that race.
+            time.sleep(_INDEXING_RETRY_SECONDS)
             retry_current, retry_errors, retry_providers = self._fetch_current(
                 wallet, selected
             )
@@ -447,9 +372,7 @@ class PositionScanner:
         for position in merged:
             position.wallet_id = wallet_id
 
-        # Filter historical closed positions: keep only active/inactive
-        # positions and closed positions that closed since the previous scan.
-        merged = self._filter_closed_positions(
+        merged, newly_closed_keys = self._filter_closed_positions(
             merged,
             closure_state_path=closure_state_path or "position_closure_state.json",
         )
@@ -464,36 +387,39 @@ class PositionScanner:
             )
         )
 
-        # Fetch SOL balance via RPC
+        token_accounts = self._last_token_accounts
+        if token_accounts is None:
+            try:
+                token_accounts = fetch_token_accounts(self.rpc, wallet, commitment="confirmed")
+            except Exception as exc:
+                errors["wallet_balances"] = str(exc)
+                token_accounts = []
+        wallet_balances = [
+            parsed
+            for parsed in (parse_token_account(account) for account in token_accounts)
+            if parsed is not None
+        ]
+
         sol_balance_lamports = 0
-        sol_price_usd = 0.0
         try:
             sol_balance_lamports = fetch_sol_balance_lamports(self.rpc, wallet)
-        except Exception:
-            pass
+        except Exception as exc:
+            errors["sol_balance"] = str(exc)
 
-        # Fetch token accounts and enrich with prices
-        wallet_balances: List[Dict[str, Any]] = []
+        mints = [SOL_MINT] + [entry["mint"] for entry in wallet_balances]
         try:
-            for account in fetch_token_accounts(self.rpc, wallet):
-                wallet_balances.append(
-                    {
-                        "mint": account["mint"],
-                        "symbol": account.get("owner", ""),
-                        "decimals": account.get("decimals", 0),
-                        "raw_amount": account.get("raw_amount", "0"),
-                        "ui_amount": account.get("ui_amount", 0.0),
-                        "price_usd": 0.0,
-                        "usd_value": 0.0,
-                    }
-                )
-        except Exception:
-            pass
+            prices = JupiterPriceClient().fetch_prices(mints)
+        except Exception as exc:
+            prices = {}
+            errors["prices"] = f"USD prices unavailable: {exc}"
+        sol_price_usd = prices.get(SOL_MINT, 0.0)
+        for entry in wallet_balances:
+            price = prices.get(entry["mint"], 0.0)
+            entry["price_usd"] = price
+            entry["usd_value"] = entry["ui_amount"] * price
 
-        # Calculate total USD value
-        wallet_total_usd = sol_balance_lamports / 1_000_000_000 * sol_price_usd
-        for bal in wallet_balances:
-            wallet_total_usd += bal.get("usd_value", 0.0)
+        wallet_total_usd = sol_balance_lamports / LAMPORTS_PER_SOL * sol_price_usd
+        wallet_total_usd += sum(entry["usd_value"] for entry in wallet_balances)
 
         return PositionScan(
             wallet=wallet,
@@ -505,6 +431,7 @@ class PositionScanner:
             positions=merged,
             errors=errors,
             history_complete=history_complete,
+            newly_closed_keys=sorted(newly_closed_keys),
         )
 
     def _fetch_current(
@@ -512,19 +439,26 @@ class PositionScanner:
     ) -> Tuple[List[LiquidityPosition], Dict[str, str], int]:
         """Fetch live positions from the selected DEX providers.
 
-        Returns (positions, errors, successful_provider_count).
+        Returns (positions, errors, successful_provider_count). The token
+        accounts used for NFT discovery are kept in ``_last_token_accounts`` so
+        the scan can reuse them for wallet balances.
         """
         errors: Dict[str, str] = {}
         current: List[LiquidityPosition] = []
         successful_providers = 0
         jobs = {}
+        self._last_token_accounts = None
         with ThreadPoolExecutor(max_workers=len(selected)) as executor:
             if "meteora" in selected:
                 jobs["meteora"] = executor.submit(self._fetch_meteora, wallet)
             nft_mints: Optional[List[str]] = None
             if "raydium" in selected or "orca" in selected:
                 try:
-                    nft_mints = self._fetch_nft_mints(wallet)
+                    token_accounts = fetch_token_accounts(
+                        self.rpc, wallet, commitment="confirmed"
+                    )
+                    self._last_token_accounts = token_accounts
+                    nft_mints = self._nft_mints(token_accounts)
                 except Exception as exc:
                     errors["nft_inventory"] = str(exc)
                     nft_mints = None
@@ -583,12 +517,12 @@ class PositionScanner:
             ]
             for account in self._program_accounts(METEORA_PROGRAM, filters):
                 data = _account_bytes(account)
-                bounds_offset = 72 + 70 * 16 + 70 * 48 + 70 * 48
+                reward_base = 72 + 70 * 16
+                fee_base = reward_base + 70 * 48
+                bounds_offset = fee_base + 70 * 48
                 if len(data) < bounds_offset + 8:
                     continue
                 shares = [_u128(data, 72 + index * 16) for index in range(70)]
-                reward_base = 72 + 70 * 16
-                fee_base = reward_base + 70 * 48
                 fees = []
                 rewards = []
                 for index in range(70):
@@ -604,7 +538,6 @@ class PositionScanner:
                             _u64(data, reward_base + index * 48 + 40),
                         )
                     )
-                bounds_offset = fee_base + 70 * 48
                 lower = struct.unpack_from("<i", data, bounds_offset)[0]
                 upper = struct.unpack_from("<i", data, bounds_offset + 4)[0]
                 liquidity = sum(shares)
@@ -624,83 +557,49 @@ class PositionScanner:
                 )
         return positions
 
-    def _fetch_nft_mints(self, wallet: str) -> List[str]:
-        calls = [
-            (
-                "getTokenAccountsByOwner",
-                [
-                    wallet,
-                    {"programId": program},
-                    {
-                        "encoding": "jsonParsed",
-                        "commitment": "confirmed",
-                    },
-                ],
-            )
-            for program in TOKEN_PROGRAMS
-        ]
+    @staticmethod
+    def _nft_mints(token_accounts: Sequence[Dict[str, Any]]) -> List[str]:
+        """Mints of wallet NFT-like holdings (decimals 0, amount 1)."""
         mints = set()
-        for result in self.rpc.batch(calls):
-            for token_account in (result or {}).get("value", []):
-                info = (
-                    ((token_account.get("account") or {}).get("data") or {}).get(
-                        "parsed"
-                    )
-                    or {}
-                ).get("info") or {}
-                amount = info.get("tokenAmount") or {}
-                if (
-                    amount.get("decimals") == 0
-                    and str(amount.get("amount")) == "1"
-                    and info.get("mint")
-                ):
-                    mints.add(info["mint"])
+        for token_account in token_accounts:
+            info = (
+                ((token_account.get("account") or {}).get("data") or {}).get("parsed")
+                or {}
+            ).get("info") or {}
+            amount = info.get("tokenAmount") or {}
+            if (
+                amount.get("decimals") == 0
+                and str(amount.get("amount")) == "1"
+                and info.get("mint")
+            ):
+                mints.add(info["mint"])
         return sorted(mints)
 
     def _fetch_nft_positions(
         self, dex: str, mints: Optional[Sequence[str]]
     ) -> List[LiquidityPosition]:
+        """Read each held NFT's position account directly by its derived PDA.
+
+        Raydium and Orca both derive the position account as
+        ``["position", position_mint]`` under their program. Batched
+        getAccountInfo replaces one full-program getProgramAccounts scan per mint.
+        """
         program = RAYDIUM_PROGRAM if dex == "raydium" else ORCA_PROGRAM
-        discriminator = _discriminator(
-            "PersonalPositionState" if dex == "raydium" else "Position"
-        )
-        mint_offset = 9 if dex == "raydium" else 40
-        calls = []
-        for mint in mints or []:
-            filters = [
-                {
-                    "memcmp": {
-                        "offset": 0,
-                        "bytes": base64.b64encode(discriminator).decode(),
-                        "encoding": "base64",
-                    }
-                },
-                {"memcmp": {"offset": mint_offset, "bytes": mint}},
-            ]
-            calls.append(
-                (
-                    "getProgramAccounts",
-                    [
-                        program,
-                        {
-                            "encoding": "base64",
-                            "commitment": "confirmed",
-                            "filters": filters,
-                        },
-                    ],
-                )
-            )
+        program_id = _b58decode(program)
+        addresses = [
+            _pda([b"position", _b58decode(mint)], program_id) for mint in mints or []
+        ]
+        accounts = self._fetch_account_bytes(addresses)
         positions: List[LiquidityPosition] = []
-        for start in range(0, len(calls), _RPC_BATCH_SIZE):
-            for result in self.rpc.batch(calls[start : start + _RPC_BATCH_SIZE]):
-                for account in result or []:
-                    data = _account_bytes(account)
-                    if dex == "raydium":
-                        position = self._decode_raydium(account.get("pubkey", ""), data)
-                    else:
-                        position = self._decode_orca(account.get("pubkey", ""), data)
-                    if position:
-                        positions.append(position)
+        for address, data in accounts.items():
+            if not data:
+                continue
+            if dex == "raydium":
+                position = self._decode_raydium(address, data)
+            else:
+                position = self._decode_orca(address, data)
+            if position:
+                positions.append(position)
         return positions
 
     @staticmethod
@@ -863,16 +762,17 @@ class PositionScanner:
     def _filter_closed_positions(
         positions: List[LiquidityPosition],
         closure_state_path: str,
-    ) -> List[LiquidityPosition]:
+    ) -> Tuple[List[LiquidityPosition], Set[str]]:
         """Exclude closed positions already emitted in a previous scan.
 
-        On the very first scan (no state file exists), all closed positions
-        are recorded as "already reported" and are omitted from output, but
+        This is the single owner of the closure state for a scan: it refreshes
+        the state file once and returns the newly closed keys alongside the
+        filtered positions. On the very first scan (no state file exists), all
+        closed positions are recorded as "already reported" and omitted, but
         they are persisted so future scans know they are old.
         """
-        state_path = closure_state_path
-        state_existed = os.path.exists(state_path)
-        closure_state = ClosureState(path=state_path)
+        state_existed = os.path.exists(closure_state_path)
+        closure_state = ClosureState(path=closure_state_path)
 
         newly_closed_tuples = closure_state.refresh(positions)
         newly_closed_keys = {key for _, key in newly_closed_tuples}
@@ -887,7 +787,8 @@ class PositionScanner:
             key = f"{position.dex}:{position.position_address}"
             return key in newly_closed_keys
 
-        return [position for position in positions if _is_kept(position)]
+        kept = [position for position in positions if _is_kept(position)]
+        return kept, newly_closed_keys
 
     @staticmethod
     def _merge_positions(

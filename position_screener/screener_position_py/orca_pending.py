@@ -71,6 +71,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 from core.rpc import RpcClient
+from core.solana import discriminator as _account_discriminator
 
 U128_MASK = (1 << 128) - 1
 TICKS_PER_ARRAY = 88
@@ -223,12 +224,6 @@ def decode_tick_array(data: Optional[bytes], tick: int) -> WhirlpoolTick:
             for i in range(3)
         ],
     )
-
-
-def _account_discriminator(name: str) -> bytes:
-    import hashlib
-
-    return hashlib.sha256(b"account:" + name.encode()).digest()[:8]
 
 
 def fee_growth_inside_values(

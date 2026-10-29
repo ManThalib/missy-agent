@@ -70,7 +70,7 @@ divmod-with-negative-fix exactly.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from core.rpc import RpcClient
 
@@ -99,12 +99,6 @@ _POSITION_LOWER = 7912
 # 2026-10-04: bytes 7912..7920 = 3debffff 81ebffff decode as two sane i32s,
 # while a 7915 read yields garbage (-1342977 on the live position).
 _POSITION_UPPER = 7916
-
-
-def _account_discriminator(name: str) -> bytes:
-    import hashlib
-
-    return hashlib.sha256(b"account:" + name.encode()).digest()[:8]
 
 
 def _trunc_div(a: int, b: int) -> int:

@@ -8,7 +8,11 @@ from .liquidity_position import LiquidityPosition
 
 @dataclass
 class PositionScan:
-    """Aggregate positions, source errors, and history completeness."""
+    """Aggregate positions, source errors, history completeness, and closures.
+
+    ``newly_closed_keys`` lists ``dex:position_address`` keys closed since the
+    previous scan; the closure state file is updated once by the scanner.
+    """
 
     wallet: str
     wallet_id: str = "main"
@@ -19,6 +23,7 @@ class PositionScan:
     positions: List[LiquidityPosition] = field(default_factory=list)
     errors: Dict[str, str] = field(default_factory=dict)
     history_complete: bool = False
+    newly_closed_keys: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -31,4 +36,5 @@ class PositionScan:
             "positions": [position.to_dict() for position in self.positions],
             "errors": dict(self.errors),
             "history_complete": self.history_complete,
+            "newly_closed_keys": list(self.newly_closed_keys),
         }

@@ -9,6 +9,8 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from .constants import HELIUS_HISTORY_URL
+from .http_client import parse_retry_after
+from .retry import call_with_retry
 
 
 class HeliusHistoryClient:
@@ -17,6 +19,25 @@ class HeliusHistoryClient:
     def __init__(self, api_key: str, timeout: float = 30.0) -> None:
         self.url = f"{HELIUS_HISTORY_URL}?api-key={urllib.parse.quote(api_key)}"
         self.timeout = timeout
+
+    def _post_page(self, payload: Dict[str, Any]) -> Any:
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "SolanaScreener/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            exc.retry_after = parse_retry_after(  # type: ignore[attr-defined]
+                exc.headers.get("Retry-After") if exc.headers else None
+            )
+            raise
 
     def fetch(
         self, address: str, max_pages: int = 0
@@ -34,19 +55,14 @@ class HeliusHistoryClient:
             }
             if token:
                 payload["paginationToken"] = token
-            request = urllib.request.Request(
-                self.url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "SolanaScreener/1.0",
-                },
-                method="POST",
-            )
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    page = json.loads(response.read().decode("utf-8"))
-            except (urllib.error.URLError, ValueError) as exc:
+                page = call_with_retry(
+                    lambda: self._post_page(payload),
+                    attempts=3,
+                    base_seconds=0.5,
+                    retry_after_of=lambda exc: getattr(exc, "retry_after", None),
+                )
+            except (OSError, ValueError, urllib.error.URLError) as exc:
                 raise RuntimeError(f"Helius history request failed: {exc}") from exc
             if not isinstance(page, dict) or not isinstance(page.get("data", []), list):
                 raise RuntimeError("Invalid Helius parsed-history response")

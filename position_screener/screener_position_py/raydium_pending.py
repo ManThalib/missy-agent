@@ -70,15 +70,16 @@ Start index formula (SDK `TickArrayUtil.getTickArrayStartIndex`):
 from __future__ import annotations
 
 import struct
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from core.constants import RAYDIUM_CLMM_PROGRAM
 from core.rpc import RpcClient
 
 U128_MASK = (1 << 128) - 1
 U64_MASK = (1 << 64) - 1
 TICKS_PER_ARRAY = 60
-RAYDIUM_CLMM_PROGRAM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
 _U32_BIAS = 1 << 31  # i32 seeds are encoded as u32 (two's complement)
 
 
@@ -103,16 +104,10 @@ def _pda(seeds: Sequence[bytes], program_id: bytes) -> str:
 
     for bump in range(255, -1, -1):
         data = b"".join(seeds) + bytes([bump])
-        h = _sha256(data, program_id, b"ProgramDerivedAddress")
+        h = hashlib.sha256(data + program_id + b"ProgramDerivedAddress").digest()
         if not _is_on_curve(h):
             return b58encode(h)
     raise ValueError("no valid PDA found")  # pragma: no cover
-
-
-def _sha256(*chunks: bytes) -> bytes:
-    import hashlib
-
-    return hashlib.sha256(b"".join(chunks)).digest()
 
 
 _CURVE_P = (1 << 255) - 19
@@ -145,7 +140,7 @@ def _is_on_curve(point: bytes) -> bool:
     if vx2 == u % _CURVE_P:
         pass
     elif vx2 == (-u) % _CURVE_P:
-        x = x * pow(2, (_CURVE_P - 1) // 4, _CURVE_P) % _CURVE_P
+        pass  # sign-flipped root (times sqrt(-1)): still a valid point
     else:
         return False  # no square root: not on curve => valid PDA candidate
     return True  # decompression succeeded: real curve point, skip for PDA

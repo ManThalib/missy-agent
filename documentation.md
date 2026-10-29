@@ -46,6 +46,7 @@ Missy-agent/
 |-- core/                               # Shared utilities
 |   |-- __init__.py
 |   |-- cache.py                      # DiskCache (per-key TTL, $MISSY_CACHE_DIR)
+|   |-- retry.py                      # transient-only retry, jittered backoff, Retry-After
 |   |-- constants.py
 |   |-- display.py
 |   |-- helius.py
@@ -77,7 +78,9 @@ Missy-agent/
 |       |-- token_config_parser.py      # symbol/mint/address/asset/value + aliases
 |       |-- token_set.py
 |       |-- whitelist.py
-|       |-- multi_dex_screener.py       # normalize_pool + fact-emitting MultiDexScreener
+|       |-- normalizers.py              # normalize_pool: provider payloads -> common shape
+|       |-- tick_fetch.py               # batched RPC tick/bin lookup, budgeted backoff
+|       |-- multi_dex_screener.py       # gating, scoring, and candidate assembly (MultiDexScreener)
 |       |-- display.py
 |       |-- client.py                   # Compatibility re-export from clients/
 |       |-- config.py                   # Compatibility re-export (DEFAULT_CONFIG)
@@ -129,7 +132,7 @@ Missy-agent/
     |-- test_wallet_screener.py
     |-- config.py                     # No USD_THRESHOLD; JUPITER_PRICE_URL re-export; resolve_rpc_url/wallet
     |-- models.py
-    |-- rpc_client.py                   # SolanaRpcClient with retry/backoff
+    |-- rpc_client.py                   # SolanaRpcClient: transient-only retry, Retry-After aware
     |-- price_fetcher.py              # TokenPriceFetcher (Jupiter)
     |-- balance_calculator.py         # enrich() prices all assets; filter_assets() kept for tests
     `-- wallet_screener.py             # WalletScanner (+wallet_id, emits all assets)
@@ -157,8 +160,8 @@ audit trail survives. Important fields:
 | `min_fee_tvl` | `float` | Retained daily LP fee/TVL percentage. Not enforced. |
 | `min_daily_fee` | `float` | Retained normalized daily LP fees in USD. Not enforced. |
 | `min_volume_usd` | `float` | Retained provider-window volume in USD. Not enforced. |
-| `min_apr` | `float` | Retained adjusted APR field. Not enforced. |
-| `min_bin_step`, `max_bin_step` | `int` | Retained Meteora bin-step / concentrated tick-spacing fields. Not enforced. |
+| `min_apr` | `float` | Retained adjusted APR field. Not enforced locally; the CLI warns when set. |
+| `min_bin_step`, `max_bin_step` | `int` | Meteora bin-step / concentrated tick-spacing filters, sent to the Meteora API as server-side filters. Not checked locally. |
 | `min_fee_pct`, `max_fee_pct` | `float` | Retained fee-tier percentage fields. Not enforced. |
 | `max_volatility` | `float` | Retained price-excursion percentage. Not enforced. |
 | `max_turnover_ratio` | `float` | Retained daily volume/TVL field. Not enforced. |
@@ -331,7 +334,10 @@ uses `{"asset", "mint", "aliases"}` objects.
 
 ### `TokenSet` and `Whitelist`
 
-`TokenSet.add()`, `replace()`, and `matches()` maintain symbol/mint matching.
+`TokenSet.add()`, `replace()`, and `matches()` maintain symbol/mint matching. A
+token that supplies an address matches a configured symbol only when the address
+is that symbol's canonical mint; symbol-only matching applies only to symbols with
+no canonical mint.
 Whitespace-free 32-44 character values are treated as likely mint addresses;
 this is a lightweight heuristic, not full public-key validation.
 
@@ -377,13 +383,15 @@ batches of 50 via Jupiter, and enriches every balance. Pricing failures are not
 fatal; affected assets are returned with `price_usd=0.0`. `BalanceCalculator`
 still exposes `calculate()` and `filter_assets()` (threshold filter kept for
 tests), but the scanner path does not filter. Unknown mints keep an empty
-symbol; `KNOWN_MINT_SYMBOLS` resolves well-known USDC/USDT/wSOL mints locally.
+symbol; `core/constants.py` `KNOWN_MINT_SYMBOLS` resolves well-known SOL/USDC/USDT/WBTC/WETH/TAO mints locally.
 
 The CLI (`wallet_screener/main.py`) accepts `--wallet`, `--wallet-id`,
 `--threshold` (compat only), `--rpc-url`, `--price-url`, `--timeout`,
-`--watch`, `--json`, `--include-dust` (no-op), `--output-dir` (default
+`--watch`, `--json`, `--include-dust` (accepted, no effect), `--output-dir` (default
 `/data/missy-data/wallet_screens`), and `--no-output-file`. `--json --watch`
-is rejected; negative `--threshold`/`--watch` values are rejected.
+is rejected; negative `--threshold`/`--watch` values are rejected. A
+screen-file write failure prints a warning and the scan result still prints.
+The scan result includes `threshold_usd` (the configured value; nothing is filtered by it).
 
 ### `TokenBalance`
 
@@ -481,8 +489,8 @@ A provider returning no positions still counts as success.
 ### Pending Fees (per-protocol SDK ports)
 
 All three ports are stdlib-only, verified against their SDKs on live mainnet
-accounts, and reached through `core/cache.py` `DiskCache` for per-pool RPC
-caching.
+accounts. Position accounts are read in one batch per scan, and a failure in one
+account keeps the checkpointed values for that position only.
 
 - **Raydium** (`raydium_pending.PendingFeesFetcher(rpc)`): fetches the live
   PoolState and both boundary tick arrays and applies the raydium-sdk-v2
@@ -571,7 +579,9 @@ normalized enrichment:
 
 - `lower_bound` and `upper_bound` are raw tick/bin identifiers.
 - `lower_price`, `upper_price`, and `current_price` are normalized prices.
-- `position_value_quote` and `fee_value_delta_quote` must use one quote currency.
+- `position_value_quote` is the USD position value (same as `position_value_usd`).
+  `fee_value_delta_quote` is not populated yet: fee APR needs a window delta from
+  snapshot history, which `fees_owed` (cumulative since the last claim) cannot provide.
 - `pool_fee_rate` is a decimal fraction.
 
 Range and boundary components remain neutral without normalized price bounds.
@@ -615,6 +625,9 @@ capital records are skipped.
 
 `ClosureState.refresh(positions)` compares closed positions with the previous
 JSON snapshot and returns `(closed_at, dex:position)` tuples for new closures.
+A position scan calls it exactly once, inside `PositionScanner._filter_closed_positions`,
+and returns the keys as `PositionScan.newly_closed_keys`. The CLI reads that list
+and does not refresh the state file again.
 Closed records without a block time use scan time. Corrupt or non-object state
 is treated as empty. Writes use a same-directory temporary file and
 `os.replace()`; write failures are raised to the caller.
@@ -645,7 +658,9 @@ distinct path.
 | `HELIUS_API_KEY` | Enable Helius RPC fallback and lifecycle history. |
 | `WALLET_PUBLIC_KEY` | Default wallet for `wallet_screener/main.py`. |
 | `JUPITER_PRICE_V2_URL` | Override Jupiter Price endpoint (default `https://api.jup.ag/price/v3`; v3 shapes parsed). |
-| `MISSY_CACHE_DIR` | Override the `DiskCache` directory (default `/tmp/missy-cache`). |
+| `MISSY_CACHE_DIR` | Override the `DiskCache` directory (default `/tmp/missy-cache`; created with mode `0700`). |
+| `MISSY_CACHE_TTL_SECONDS` | HTTP and cache TTL in seconds (default `300`). Watch mode caps it at the `--watch` interval. |
+| `MISSY_POOL_SCAN_DIR` | Directory searched for `pool_scan-*.json` by position enrichment (default `/data/missy-data/pool_screens`). |
 | `WALLET_ID` | Cron-wrapper logical wallet tag consumed by `run_positions.sh` / `run_wallet.sh` (default `main`). |
 
 The project does not load `.env` itself. Set variables before the Python process

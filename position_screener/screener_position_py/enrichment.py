@@ -15,7 +15,7 @@ from .position_features import build_position_features
 
 def _latest_pool_scan() -> Optional[str]:
     """Return the most recent pool scan JSON path, or None."""
-    outdir = "/data/missy-data/pool_screens"
+    outdir = os.environ.get("MISSY_POOL_SCAN_DIR", "/data/missy-data/pool_screens")
     paths = sorted(
         p for p in glob.glob(os.path.join(outdir, "pool_scan-*.json"))
         if not p.endswith((".failed", ".invalid"))
@@ -24,21 +24,22 @@ def _latest_pool_scan() -> Optional[str]:
 
 
 def _load_pool_data(path: str) -> Dict[str, Dict[str, Any]]:
-    """Load pool scan and return pool_address -> pool dict."""
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            pools = json.load(fh)
-        if isinstance(pools, dict):
-            pools = pools.get("pools", [])
-        if not isinstance(pools, list):
-            return {}
-        return {
-            p["pool_address"]: p
-            for p in pools
-            if isinstance(p, dict) and p.get("pool_address")
-        }
-    except Exception:
-        return {}
+    """Load a pool scan and return pool_address -> pool dict.
+
+    Raises OSError or ValueError when the file cannot be read or parsed; the
+    caller records that in the scan errors instead of enriching silently.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        pools = json.load(fh)
+    if isinstance(pools, dict):
+        pools = pools.get("pools", [])
+    if not isinstance(pools, list):
+        raise ValueError(f"pool scan {path} has no pool list")
+    return {
+        p["pool_address"]: p
+        for p in pools
+        if isinstance(p, dict) and p.get("pool_address")
+    }
 
 
 def _token_prices(pool: Dict[str, Any]) -> tuple:
@@ -182,7 +183,7 @@ def _derive_current_tick(pool: Dict[str, Any]) -> int:
     if pool_price > 0 and dec_x > 0 and dec_y > 0:
         raw_price = pool_price * (10 ** (dec_y - dec_x))
         if raw_price > 0:
-            return int(math.log(raw_price) / math.log(1.0001))
+            return math.floor(math.log(raw_price) / math.log(1.0001))
     return 0
 
 
@@ -209,14 +210,16 @@ def _position_amounts(
 
 
 def _compute_value(
-    position: LiquidityPosition, pool: Dict[str, Any]
+    position: LiquidityPosition,
+    pool: Dict[str, Any],
+    amounts: Optional[tuple] = None,
 ) -> float:
     """Estimate current position USD value from liquidity and pool state."""
     px, py, dx, dy = _token_prices(pool)
     if px <= 0 or py <= 0 or dx <= 0 or dy <= 0:
         return 0.0
 
-    amount_x, amount_y = _position_amounts(position, pool)
+    amount_x, amount_y = amounts if amounts is not None else _position_amounts(position, pool)
     real_x = amount_x / (10 ** dx)
     real_y = amount_y / (10 ** dy)
     return real_x * px + real_y * py
@@ -299,8 +302,6 @@ def _enrich_one(
     px, py, _, _ = _token_prices(pool)
     position.token_x_price_usd = px
     position.token_y_price_usd = py
-    position.token_x_amount = {"raw": str(position.liquidity_raw), "ui": 0.0}
-    position.token_y_amount = {"raw": str(position.liquidity_raw), "ui": 0.0}
 
     if position.dex in ("orca", "raydium"):
         pool_price = float(pool.get("pool_price") or 0.0)
@@ -316,7 +317,7 @@ def _enrich_one(
         if current_tick == 0 and pool_price > 0 and dec_x > 0 and dec_y > 0:
             raw_price = pool_price * (10 ** (dec_y - dec_x))
             if raw_price > 0:
-                current_tick = int(math.log(raw_price) / math.log(1.0001))
+                current_tick = math.floor(math.log(raw_price) / math.log(1.0001))
 
         if pool_price > 0 and current_tick != 0:
             position.current_price = pool_price
@@ -384,9 +385,10 @@ def _enrich_one(
                 position.lower_price = 0.0
                 position.upper_price = 0.0
         else:
-            position.current_price = float(active_bin) if active_bin is not None else 0.0
-            position.lower_price = float(lower)
-            position.upper_price = float(upper)
+            # Without a bin step, bin ids are not prices; leave prices unknown.
+            position.current_price = 0.0
+            position.lower_price = 0.0
+            position.upper_price = 0.0
         position.current_bin_id = active_bin if active_bin is not None else 0
         position.in_range = (
             active_bin is not None and lower <= active_bin <= upper
@@ -403,7 +405,9 @@ def _enrich_one(
     _dx = int(pool.get("token_x_decimals") or 0)
     _dy = int(pool.get("token_y_decimals") or 0)
     _amount_x, _amount_y = _position_amounts(position, pool)
-    position.current_value_usd = _compute_value(position, pool)
+    position.current_value_usd = _compute_value(
+        position, pool, (_amount_x, _amount_y)
+    )
 
     # Meteora DLMM value requires the scanner's per-bin computed amounts;
     # without them the value is unknown, not zero.
@@ -437,6 +441,7 @@ def _enrich_one(
             "token_x_price_usd": px,
             "token_y_price_usd": py,
             "position_value_usd": position.current_value_usd,
+            "position_value_quote": position.current_value_usd,
             "current_price": position.current_price,
             "lower_price": position.lower_price,
             "upper_price": position.upper_price,
@@ -459,8 +464,15 @@ def enrich_positions(
     """
     scan_path = _latest_pool_scan()
     if not scan_path:
+        if errors is not None:
+            errors["pool_scan"] = "no pool scan found; positions were not enriched"
         return
-    pools = _load_pool_data(scan_path)
+    try:
+        pools = _load_pool_data(scan_path)
+    except (OSError, ValueError) as exc:
+        if errors is not None:
+            errors["pool_scan"] = f"pool scan {scan_path} unreadable: {exc}"
+        return
     now = time.time()
 
     # Third-party reward tokens (e.g. RAY) price via Jupiter once per scan.

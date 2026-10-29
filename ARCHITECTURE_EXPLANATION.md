@@ -37,6 +37,20 @@ sort by score → print_results() or json.dump()
 - **`load_whitelist()`**: Loads `tokens.json`; allows `--tokens` and `--paired-tokens` overrides.
 - **`main()`**: Orchestrates the scan cycle: creates `FilterConfig`, optional `RpcClient` (if `SOLANA_RPC_URL` set), and `MultiDexScreener`. Runs `screener.fetch_and_screen()`, prints warnings for provider errors, then either JSON-outputs candidates or calls `print_results()`.
 
+### `pool_screener/screener_py/normalizers.py`, `tick_fetch.py`, `multi_dex_screener.py`
+
+Screening is split across three modules:
+
+- `normalizers.py`: `normalize_pool()` converts each provider payload into the common
+  shape. It is the only place provider field names are read. Meteora payloads fall
+  back to `address` when `pool_address` is absent.
+- `tick_fetch.py`: batched `getAccountInfo` lookups for live Orca/Raydium ticks and
+  Meteora active bins. Each chunk uses `RpcClient.batch_partial()`, so one failed
+  account does not fail its chunk. Total planned backoff is capped at 30 s, and a
+  batch in which every lookup fails sets the screener's `_rpc_unavailable` flag.
+  That flag skips per-pool RPC fallbacks for the cycle.
+- `multi_dex_screener.py`: gating, scoring, and candidate assembly.
+
 ### `pool_screener/screener_py/multi_dex_screener.py` — Screening Engine
 - **`MultiDexScreener`** class: Core logic container.
   - `__init__()`: Stores `Whitelist`, `FilterConfig`, creates `MultiDexClient` (with concurrent Raydium/Orca/Meteora clients), loads policy via `load_policy()`, creates `PoolScorer(ScoringConfig.from_policy())`.
@@ -117,7 +131,7 @@ Dataclass `Candidate` with fields for:
 - Handles closure state, prints results or JSON output.
 
 ### `position_screener/screener_position_py/position_scanner.py` — Position Discovery
-- **`PositionScanner`**: Fetches live on-chain positions via `getProgramAccounts` for each DEX program (Meteora LBPair, Raydium PersonalPositionState, Orca Position). Falls back to Helius history if `HELIUS_API_KEY` set.
+- **`PositionScanner`**: Fetches live on-chain positions. Meteora positions come from `getProgramAccounts`. Raydium and Orca positions are read at the derived account `["position", position_mint]`, with mints taken from the wallet's NFT-like token accounts (decimals 0, amount 1). Falls back to Helius history if `HELIUS_API_KEY` set.
 - **`_fetch_current()`**: Concurrent fetch across selected DEXes. Meteora fetches PositionV2/Position accounts; Raydium/Orca fetches NFT mint mints then decodes positions.
 - **`_refresh_raydium_pending()`**: Recomputes live pending fees/rewards using `raydium_pending.py` SDK math (PoolState + tick arrays). Checkpoint values stale if never claimed.
 - **`_refresh_orca_pending()`**: Same for Orca via `orca_pending.py`.
@@ -185,7 +199,7 @@ for pool in pools:
 price_map = self._fetch_pool_prices([pool for pool, *_ in kept])
 # JupiterPriceClient.fetch_prices(mints) → {mint_address: price_usd}
 # Cached via DiskCache (300s default)
-# If Jupiter fetch fails: returns {}; pools still screened but with price_source="unavailable"
+# If Jupiter fetch fails: returns {}, a warning is recorded, and pools are still screened with price_source="unavailable"
 ```
 
 #### Step 5: Phase 3 — Re-Normalize with Prices + RPC Tick/Bin Enrichment
@@ -277,7 +291,7 @@ position_scanner = PositionScanner()  # creates with RPC, optional Helius client
 # PositionScanner._fetch_current(wallet, selected=["meteora", "raydium", "orca"])
 # Uses ThreadPoolExecutor across selected DEXes:
 #   - Meteora: getProgramAccounts(LBProgram, memcmp filters for wallet) → decode PositionV2 accounts
-#   - Raydium: fetch NFT mint mints → getProgramAccounts(PersonalPositionState, memcmp mint) → decode positions
+#   - Raydium: fetch NFT mint mints → derive PersonalPositionState PDA per mint → batched getAccountInfo → decode positions
 #   - Orca: same as Raydium but for ORCA Program
 # Returns (current_positions, errors, successful_providers)
 ```
@@ -354,7 +368,7 @@ scanner = WalletScanner(
 # scan(wallet):
 #   - lamports = self.rpc.get_balance_lamports(wallet)
 #   - Token accounts via self.rpc.get_token_accounts(wallet)
-#   - _parse_token_account(): maps jsonParsed info → TokenBalance (mint, symbol, decimals, amount_ui)
+#   - _parse_token_account(): delegates to core.wallet_balances.parse_token_account() (jsonParsed info → TokenBalance)
 #   - SOL native: TokenBalance.native_sol(lamports)
 #   - TokenBalance known mints have symbols from KNOWN_MINT_SYMBOLS dict
 ```
@@ -530,7 +544,7 @@ _yield_over_tvl_apr(fee_usd, tvl_usd, window):
 
 ### 5.5 Data Flow Constraints
 - **No API keys required**: All three DEX discovery APIs are public-keyless. Helius RPC optional via `HELIUS_API_KEY`.
-- **Cache TTL**: Default 300s (5 minutes) via `DiskCache`. Controlled by `MISSY_CACHE_TTL_SECONDS` env var or `$MISSY_CACHE_DIR`.
+- **Cache TTL**: Default 300s (5 minutes) via `DiskCache`. Controlled by `MISSY_CACHE_TTL_SECONDS` env var or `$MISSY_CACHE_DIR`. In `--watch` mode the TTL is capped at the poll interval.
 - **Wallet ID**: Default `"main"`; passed through via `$WALLET_ID` env var or `--wallet-id` CLI flag.
 - **Position features versioned**: `FEATURES_VERSION=1`; gaps recorded so consumers can apply fail-closed policies.
 

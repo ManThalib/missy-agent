@@ -21,7 +21,7 @@ from screener_position_py.position_scanner import PositionScanner
 class TestMeteoraPendingBestEffort(unittest.TestCase):
     def test_rpc_failure_keeps_checkpoint_and_records_error(self):
         scanner = PositionScanner.__new__(PositionScanner)
-        scanner._fetch_meteora_position_accounts = Mock(
+        scanner._fetch_account_bytes = Mock(
             side_effect=RuntimeError("RPC rate limited (HTTP 429)")
         )
         position = LiquidityPosition(
@@ -42,14 +42,14 @@ class TestMeteoraPendingBestEffort(unittest.TestCase):
 
     def test_inactive_positions_are_not_enriched(self):
         scanner = PositionScanner.__new__(PositionScanner)
-        scanner._fetch_meteora_position_accounts = Mock()
+        scanner._fetch_account_bytes = Mock()
         position = LiquidityPosition(
             dex="meteora", position_address="position-1", status="closed"
         )
 
         scanner._refresh_meteora_pending([position])
 
-        scanner._fetch_meteora_position_accounts.assert_not_called()
+        scanner._fetch_account_bytes.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

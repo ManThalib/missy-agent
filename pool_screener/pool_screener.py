@@ -13,7 +13,20 @@ from screener_py import (
     print_results,
 )
 
+from core.cache import cache_ttl_from_env
 from core.rpc import RpcClient
+
+# Threshold flags parsed for compatibility but not enforced by the screener.
+# Policy gates (missy_policy.json) are the only enforced thresholds for these.
+_UNENFORCED_FLAGS = (
+    ("min_fee_tvl", "--min-fee-tvl"),
+    ("min_daily_fee", "--min-daily-fee"),
+    ("min_apr", "--min-apr"),
+    ("max_volatility", "--max-volatility"),
+    ("min_fee_pct", "--min-fee-pct"),
+    ("max_fee_pct", "--max-fee-pct"),
+)
+
 
 def _positive_int(value: str) -> int:
     parsed = int(value)
@@ -168,6 +181,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.json and args.watch:
         parser.error("--json cannot be combined with --watch")
+    if args.watch < 0:
+        parser.error("--watch cannot be negative")
     if args.dex == "meteora" and args.timeframe != "24h":
         parser.error("Meteora CLI scans support only the 24h timeframe")
     for minimum, maximum, label in (
@@ -189,6 +204,20 @@ def parse_args(argv=None):
         if value < 0:
             parser.error(f"{label} cannot be negative")
     return args
+
+def unenforced_flag_warnings(args) -> list:
+    """Warnings for non-default threshold flags the screener does not enforce."""
+    warnings = []
+    for dest, flag in _UNENFORCED_FLAGS:
+        if getattr(args, dest) != getattr(DEFAULT_CONFIG, dest):
+            warnings.append(f"{flag} is parsed but not enforced; policy gates apply")
+    tvl_flags_set = args.min_tvl != DEFAULT_CONFIG.min_tvl or args.max_tvl != DEFAULT_CONFIG.max_tvl
+    if args.dex in ("raydium", "all") and tvl_flags_set:
+        warnings.append("Raydium does not apply --min-tvl/--max-tvl; policy gates apply")
+    if args.dex in ("raydium", "orca") and (args.min_bin_step or args.max_bin_step):
+        warnings.append("--min-bin-step/--max-bin-step apply to Meteora DLMM only")
+    return warnings
+
 
 def load_whitelist(args) -> Whitelist:
     whitelist = (
@@ -215,10 +244,16 @@ def main() -> int:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
     config = FilterConfig.from_args(args)
+    for warning in unenforced_flag_warnings(args):
+        print(f"Warning: {warning}", file=sys.stderr)
     # Active-bin enrichment via RPC is opt-in: set SOLANA_RPC_URL to enable.
     rpc_url = os.environ.get("SOLANA_RPC_URL", "").strip()
     rpc = RpcClient(rpc_url) if rpc_url else None
-    screener = MultiDexScreener(whitelist=whitelist, config=config, rpc=rpc)
+    # Watch mode must not serve data older than the poll interval.
+    cache_ttl = min(cache_ttl_from_env(), float(args.watch)) if args.watch else None
+    screener = MultiDexScreener(
+        whitelist=whitelist, config=config, rpc=rpc, cache_ttl_seconds=cache_ttl
+    )
 
     def run_cycle() -> bool:
         current_time = time.strftime("%H:%M:%S")
@@ -237,6 +272,8 @@ def main() -> int:
         provider_errors = getattr(screener.client, "errors", {})
         for provider, error in provider_errors.items():
             print(f"Warning: {provider} provider failed: {error}", file=sys.stderr)
+        for warning in screener.warnings:
+            print(f"Warning: {warning}", file=sys.stderr)
 
         if args.json:
             json.dump(

@@ -11,7 +11,6 @@ import socket
 import sys
 import threading
 import unittest
-import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
 
@@ -21,8 +20,8 @@ if _REPO_ROOT not in sys.path:
 
 from core.http_client import (
     HttpJsonClient,
-    _IPv4HTTPHandler,
-    _IPv4HTTPSHandler,
+    _IPv4HTTPConnection,
+    _IPv4HTTPSConnection,
     _create_connection_ipv4,
 )
 
@@ -61,20 +60,17 @@ class TestIPv4Resolver(unittest.TestCase):
             with self.assertRaises(OSError):
                 _create_connection_ipv4(("example.com", 80), timeout=5)
 
-class TestOpenerWiring(unittest.TestCase):
-    def test_opener_uses_ipv4_handlers_only(self):
+class TestConnectionWiring(unittest.TestCase):
+    def test_client_uses_ipv4_connection_classes(self):
         client = HttpJsonClient("https://example.com")
-        handlers = client._opener.handlers
+        https_conn = client._connection("https", "example.com", 443)
+        http_conn = client._connection("http", "example.com", 80)
 
-        self.assertTrue(any(isinstance(h, _IPv4HTTPHandler) for h in handlers))
-        self.assertTrue(any(isinstance(h, _IPv4HTTPSHandler) for h in handlers))
-        # The stock handlers must be replaced, not stacked after the IPv4 ones.
-        self.assertFalse(
-            any(type(h) is urllib.request.HTTPHandler for h in handlers)
-        )
-        self.assertFalse(
-            any(type(h) is urllib.request.HTTPSHandler for h in handlers)
-        )
+        self.assertIsInstance(https_conn, _IPv4HTTPSConnection)
+        self.assertIsInstance(http_conn, _IPv4HTTPConnection)
+        # Connections are reused per host rather than rebuilt per request.
+        self.assertIs(https_conn, client._connection("https", "example.com", 443))
+        client.close()
 
 class _JsonHandler(BaseHTTPRequestHandler):
     def do_GET(self):

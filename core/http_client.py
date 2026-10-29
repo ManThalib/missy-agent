@@ -1,4 +1,8 @@
-"""Shared standard-library HTTP client for JSON APIs."""
+"""Shared standard-library HTTP client for JSON APIs.
+
+Connections are kept alive per host and retries are limited to transient
+failures (timeouts, resets, HTTP 429 and 5xx) with a capped Retry-After.
+"""
 
 from __future__ import annotations
 
@@ -6,14 +10,60 @@ import http.client
 import json
 import socket
 import time
-import urllib.error
-import urllib.request
-from typing import Any, Dict, List, Optional
+import urllib.parse
+from typing import Any, Dict, List, Optional, Tuple
 
-from .cache import DiskCache
+from .cache import DiskCache, cache_ttl_from_env
+from .retry import call_with_retry
 
 PAGE_DELAY_SECONDS = 0.15
+REQUEST_ATTEMPTS = 3
+REQUEST_BACKOFF_SECONDS = 0.5
+MAX_REDIRECTS = 3
 _DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; PoolScreener/1.0)"
+_REDACTED_QUERY_KEYS = frozenset({"api-key", "api_key", "apikey", "key", "token"})
+_CONNECTION_ERRORS = (
+    http.client.RemoteDisconnected,
+    http.client.BadStatusLine,
+    BrokenPipeError,
+    ConnectionResetError,
+)
+
+
+def redact_url(url: str) -> str:
+    """Return *url* with credential-bearing query values replaced by ``***``."""
+    parts = urllib.parse.urlsplit(url)
+    if not parts.query:
+        return url
+    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    cleaned = [
+        (key, "***" if key.lower() in _REDACTED_QUERY_KEYS else value)
+        for key, value in pairs
+    ]
+    return urllib.parse.urlunsplit(
+        parts._replace(query=urllib.parse.urlencode(cleaned))
+    )
+
+
+class HttpStatusError(RuntimeError):
+    """A non-success HTTP response; carries the status and Retry-After hint."""
+
+    def __init__(
+        self, url: str, status_code: int, retry_after: Optional[float] = None
+    ) -> None:
+        super().__init__(f"GET {redact_url(url)[:120]} failed: HTTP {status_code}")
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Seconds from a Retry-After header (numeric form only); None if absent."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        return None
 
 
 def _create_connection_ipv4(
@@ -72,38 +122,78 @@ class _IPv4HTTPSConnection(http.client.HTTPSConnection):
         )
 
 
-class _IPv4HTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, req):
-        return self.do_open(_IPv4HTTPConnection, req)
-
-
-class _IPv4HTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, req):
-        return self.do_open(
-            _IPv4HTTPSConnection,
-            req,
-            context=self._context,
-            check_hostname=self._check_hostname,
-        )
-
-
 class HttpJsonClient:
     """Fetch JSON objects from a REST endpoint.
 
     Concrete clients supply provider-specific query parameters and pagination
-    while sharing the HTTP request, error handling, and per-page delay.
+    while sharing the HTTP request, retry, caching, and per-page delay logic.
     """
 
     def __init__(self, base_url: str, timeout: float = 15.0) -> None:
         self.base_url = base_url
         self.timeout = timeout
         self.cache: Optional[DiskCache] = None
-        self._opener = urllib.request.build_opener(
-            _IPv4HTTPHandler(), _IPv4HTTPSHandler()
-        )
+        self.cache_ttl_seconds: float = cache_ttl_from_env()
+        self._connections: Dict[Tuple[str, str, int], http.client.HTTPConnection] = {}
 
     def _cache_key(self, url: str) -> str:
         return url
+
+    def close(self) -> None:
+        for connection in self._connections.values():
+            connection.close()
+        self._connections.clear()
+
+    def _connection(self, scheme: str, host: str, port: int) -> http.client.HTTPConnection:
+        key = (scheme, host, port)
+        connection = self._connections.get(key)
+        if connection is None:
+            cls = _IPv4HTTPSConnection if scheme == "https" else _IPv4HTTPConnection
+            connection = cls(host, port, timeout=self.timeout)
+            self._connections[key] = connection
+        return connection
+
+    def _send(self, url: str) -> Tuple[int, Dict[str, str], bytes]:
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme or "https"
+        port = parts.port or (443 if scheme == "https" else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path = f"{path}?{parts.query}"
+        headers = {"User-Agent": _DEFAULT_USER_AGENT, "Accept": "application/json"}
+        for attempt in range(2):
+            connection = self._connection(scheme, parts.hostname or "", port)
+            try:
+                connection.request("GET", path, headers=headers)
+                response = connection.getresponse()
+                body = response.read()
+                return response.status, dict(response.getheaders()), body
+            except _CONNECTION_ERRORS:
+                # Idle keep-alive sockets get closed by the server; reconnect once.
+                connection.close()
+                self._connections.pop((scheme, parts.hostname or "", port), None)
+                if attempt == 1:
+                    raise
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def _request(self, url: str) -> bytes:
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            status, headers, body = self._send(current)
+            if status in (301, 302, 303, 307, 308):
+                location = headers.get("Location") or headers.get("location")
+                if not location:
+                    raise HttpStatusError(current, status)
+                current = urllib.parse.urljoin(current, location)
+                continue
+            if status >= 400:
+                raise HttpStatusError(
+                    current,
+                    status,
+                    parse_retry_after(headers.get("Retry-After")),
+                )
+            return body
+        raise RuntimeError(f"GET {redact_url(url)[:120]} exceeded redirect limit")
 
     def _get_json(self, url: str) -> Dict[str, Any]:
         cache = self.cache
@@ -112,24 +202,28 @@ class HttpJsonClient:
             if cached is not None:
                 return cached
 
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": _DEFAULT_USER_AGENT,
-                "Accept": "application/json",
-            },
-        )
         try:
-            with self._opener.open(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, ValueError) as exc:
-            raise RuntimeError(f"GET {url[:120]} failed: {exc}") from exc
+            body = call_with_retry(
+                lambda: self._request(url),
+                attempts=REQUEST_ATTEMPTS,
+                base_seconds=REQUEST_BACKOFF_SECONDS,
+                retry_after_of=lambda exc: getattr(exc, "retry_after", None),
+            )
+        except HttpStatusError:
+            raise
+        except (OSError, http.client.HTTPException) as exc:
+            raise RuntimeError(f"GET {redact_url(url)[:120]} failed: {exc}") from exc
+
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except ValueError as exc:
+            raise RuntimeError(f"GET {redact_url(url)[:120]} failed: {exc}") from exc
         if isinstance(data, dict) and data.get("success") is False:
             raise RuntimeError(f"API error: {data.get('msg') or 'unknown error'}")
         if not isinstance(data, dict):
             raise RuntimeError("API returned a non-object JSON payload")
         if cache is not None:
-            cache.set("http", self._cache_key(url), value=data, ttl_seconds=300)
+            cache.set("http", self._cache_key(url), value=data, ttl_seconds=self.cache_ttl_seconds)
         return data
 
     @staticmethod

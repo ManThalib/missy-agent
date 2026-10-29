@@ -46,7 +46,22 @@ RAYDIUM_AMM_V4_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+# Wormhole WBTC on Solana (validated as base58; the previous constant was 43 chars).
+WBTC_MINT = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
+# Wormhole WETH on Solana (the previous 45-char constant was not a valid address).
+WETH_MINT = "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
+TAO_MINT = "4zMMC9srt5RiM3NSBBsVpzTbkHhsUoZ9ToGYBcHousX"
 WRAPPED_SOL_MINT = SOL_MINT
+
+# Canonical display symbols for well-known mints (shared by pool and wallet code).
+KNOWN_MINT_SYMBOLS = {
+    SOL_MINT: "SOL",
+    USDC_MINT: "USDC",
+    USDT_MINT: "USDT",
+    WBTC_MINT: "WBTC",
+    WETH_MINT: "WETH",
+    TAO_MINT: "TAO",
+}
 
 # SPL token programs (legacy and Token-2022) and unit constants.
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"

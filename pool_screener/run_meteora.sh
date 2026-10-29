@@ -2,7 +2,8 @@
 # Missy pool screener cronjob wrapper.
 # Runs the pool screener across all three DEXes (Meteora, Raydium, Orca), writes timestamped JSON output.
 set -u
-REPO=/data/missy-agent/pool_screener
+# Resolve the screener from this script's location (no hardcoded host path).
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTDIR=/data/missy-data/pool_screens
 LOG=/data/missy-data/pool_screens/cron.log
 # Use Asia/Shanghai (UTC+8) for all timestamps and filenames.
