@@ -28,6 +28,8 @@ class TokenBalance:
             "mint": self.mint,
             "symbol": self.symbol,
             "decimals": self.decimals,
+            "raw_balance": self.amount_raw,
+            "value_usd": round(self.amount_ui * self.price_usd, 8),
             "amount_raw": self.amount_raw,
             "amount_ui": self.amount_ui,
             "price_usd": self.price_usd,
